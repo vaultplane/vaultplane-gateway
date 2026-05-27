@@ -4,6 +4,7 @@
 //! and the Anthropic Messages schema. System messages are hoisted to Anthropic's
 //! top-level `system` field, `max_tokens` is supplied (Anthropic requires it), and
 //! the response, finish reason, and token usage are mapped back to the OpenAI shape.
+//! The upstream model comes from the route, not the request body.
 //!
 //! Streaming requests are not yet supported (they return 501). Multimodal (array)
 //! message content is not yet supported.
@@ -11,13 +12,11 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::{Error, Result};
-use crate::provider::{BodyStream, ChatRequest, ChatResponse, Connector};
+use crate::provider::{ChatRequest, ChatResponse, Connector, single_chunk};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
@@ -46,7 +45,6 @@ impl AnthropicConnector {
 // Incoming OpenAI Chat Completions request (the subset we read).
 #[derive(Deserialize)]
 struct OpenAiRequest {
-    model: String,
     #[serde(default)]
     messages: Vec<OpenAiMessage>,
     #[serde(default)]
@@ -111,8 +109,9 @@ struct AnthropicUsage {
     output_tokens: u32,
 }
 
-/// Translate an OpenAI Chat Completions request into an Anthropic Messages request.
-fn to_anthropic_request(body: &[u8]) -> Result<AnthropicRequest> {
+/// Translate an OpenAI Chat Completions body into an Anthropic Messages request for
+/// the given upstream model.
+fn to_anthropic_request(body: &[u8], model: &str) -> Result<AnthropicRequest> {
     let request: OpenAiRequest = serde_json::from_slice(body)
         .map_err(|e| Error::Provider(format!("invalid chat request: {e}")))?;
 
@@ -133,7 +132,7 @@ fn to_anthropic_request(body: &[u8]) -> Result<AnthropicRequest> {
     }
 
     Ok(AnthropicRequest {
-        model: request.model,
+        model: model.to_string(),
         messages,
         max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         system: (!system.is_empty()).then_some(system),
@@ -188,11 +187,6 @@ fn to_openai_response(body: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| Error::Provider(format!("failed to encode response: {e}")))
 }
 
-/// Wrap a complete body as a single-chunk stream.
-fn single_chunk(bytes: Vec<u8>) -> BodyStream {
-    stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(bytes)) }).boxed()
-}
-
 #[async_trait]
 impl Connector for AnthropicConnector {
     fn name(&self) -> &str {
@@ -211,7 +205,7 @@ impl Connector for AnthropicConnector {
             });
         }
 
-        let payload = serde_json::to_vec(&to_anthropic_request(&request.body)?)
+        let payload = serde_json::to_vec(&to_anthropic_request(&request.body, &request.model)?)
             .map_err(|e| Error::Provider(format!("failed to encode request: {e}")))?;
 
         let url = format!("{}/v1/messages", self.base_url);
@@ -272,9 +266,11 @@ mod tests {
             .and(path("/v1/messages"))
             .and(header("x-api-key", "test-key"))
             .and(header("anthropic-version", ANTHROPIC_VERSION))
-            .and(body_partial_json(
-                json!({ "system": "be brief", "max_tokens": 4096 }),
-            ))
+            .and(body_partial_json(json!({
+                "model": "claude-3-7-sonnet",
+                "system": "be brief",
+                "max_tokens": 4096
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "msg_1",
                 "model": "claude-3-7-sonnet",
@@ -287,7 +283,7 @@ mod tests {
 
         let connector = AnthropicConnector::new(server.uri(), "test-key").unwrap();
         let body = serde_json::to_vec(&json!({
-            "model": "claude-3-7-sonnet",
+            "model": "ignored-the-route-model-wins",
             "messages": [
                 { "role": "system", "content": "be brief" },
                 { "role": "user", "content": "hello" }

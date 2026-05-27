@@ -26,6 +26,8 @@ pub struct Config {
     pub providers: Providers,
     /// Authentication configuration (admin token and virtual keys).
     pub auth: Auth,
+    /// Virtual model registry: maps a model name to a primary provider and fallbacks.
+    pub models: Vec<ModelConfig>,
 }
 
 /// Listener addresses.
@@ -115,6 +117,42 @@ impl Default for Auth {
     }
 }
 
+/// A virtual model: a primary provider route plus ordered fallbacks and a failover
+/// policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    /// The virtual model name clients request.
+    pub name: String,
+    /// The primary provider route.
+    pub primary: Route,
+    /// Ordered fallback routes, tried in turn when the primary fails.
+    #[serde(default)]
+    pub fallbacks: Vec<Route>,
+    /// HTTP status codes that trigger failover to the next route.
+    #[serde(default = "default_retry_on")]
+    pub retry_on: Vec<u16>,
+    /// Per-attempt timeout in milliseconds.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// A provider plus the upstream model name to send it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Route {
+    /// Provider name (for example `openai` or `anthropic`).
+    pub provider: String,
+    /// Upstream model name to send to that provider.
+    pub model: String,
+}
+
+fn default_retry_on() -> Vec<u16> {
+    vec![429, 500, 502, 503, 504]
+}
+
+fn default_timeout_ms() -> u64 {
+    30_000
+}
+
 impl Config {
     /// Load configuration by layering defaults, an optional YAML file, and
     /// environment variables (prefixed `VAULTPLANE_`, nested keys split on `__`).
@@ -151,6 +189,7 @@ mod tests {
             assert_eq!(cfg.providers.anthropic.api_key_env, "ANTHROPIC_API_KEY");
             assert_eq!(cfg.auth.admin_token_env, "VAULTPLANE_ADMIN_TOKEN");
             assert!(cfg.auth.keys.is_empty());
+            assert!(cfg.models.is_empty());
 
             // A YAML file overrides one field; the other keeps its default.
             jail.create_file("vp.yaml", "listen:\n  address: \"127.0.0.1:9000\"\n")?;
@@ -169,6 +208,19 @@ mod tests {
             assert_eq!(cfg.listen.address, "127.0.0.1:9000");
             assert_eq!(cfg.listen.admin_address, "127.0.0.1:9100");
             assert_eq!(cfg.providers.openai.base_url, "http://localhost:1234");
+
+            // The model registry parses, with failover defaults filled in.
+            jail.create_file(
+                "models.yaml",
+                "models:\n  - name: smart\n    primary: { provider: openai, model: gpt-4o }\n    fallbacks:\n      - { provider: anthropic, model: claude-3-7-sonnet }\n",
+            )?;
+            let cfg = Config::load(Some(Path::new("models.yaml"))).unwrap();
+            assert_eq!(cfg.models.len(), 1);
+            assert_eq!(cfg.models[0].name, "smart");
+            assert_eq!(cfg.models[0].primary.provider, "openai");
+            assert_eq!(cfg.models[0].fallbacks.len(), 1);
+            assert_eq!(cfg.models[0].retry_on, vec![429, 500, 502, 503, 504]);
+            assert_eq!(cfg.models[0].timeout_ms, 30_000);
 
             Ok(())
         });

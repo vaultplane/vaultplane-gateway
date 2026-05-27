@@ -7,6 +7,7 @@
 mod admin;
 mod proxy;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -20,7 +21,7 @@ use vaultplane_core::config::Config;
 use vaultplane_core::provider::Connector;
 use vaultplane_core::provider::anthropic::AnthropicConnector;
 use vaultplane_core::provider::openai::OpenAiConnector;
-use vaultplane_core::provider::routing::RoutingConnector;
+use vaultplane_core::provider::registry::Registry;
 
 use crate::admin::AppState;
 
@@ -77,8 +78,8 @@ fn read_key(var: &str, provider: &str) -> String {
     key
 }
 
-/// Build the upstream provider connectors from configuration and route by model.
-fn build_connector(config: &Config) -> anyhow::Result<Arc<dyn Connector>> {
+/// Build the provider connectors and the model registry from configuration.
+fn build_router(config: &Config) -> anyhow::Result<Arc<dyn Connector>> {
     let openai_cfg = &config.providers.openai;
     let openai: Arc<dyn Connector> = Arc::new(
         OpenAiConnector::new(
@@ -97,7 +98,16 @@ fn build_connector(config: &Config) -> anyhow::Result<Arc<dyn Connector>> {
         .context("failed to build Anthropic connector")?,
     );
 
-    Ok(Arc::new(RoutingConnector::new(openai, anthropic)))
+    let connectors = HashMap::from([
+        ("openai".to_string(), openai),
+        ("anthropic".to_string(), anthropic),
+    ]);
+    let registry =
+        Registry::new(connectors, &config.models).context("failed to build model registry")?;
+    if !config.models.is_empty() {
+        tracing::info!(count = config.models.len(), "loaded model registry");
+    }
+    Ok(Arc::new(registry))
 }
 
 /// Read the admin token from the configured environment variable.
@@ -127,7 +137,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         )
     })?;
 
-    let connector = build_connector(&config)?;
+    let connector = build_router(&config)?;
     let admin_token = read_admin_token(&config);
 
     let keys = Arc::new(KeyStore::new(config.auth.keys.clone()));

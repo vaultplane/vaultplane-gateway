@@ -8,20 +8,26 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::BoxStream;
+use futures::StreamExt;
+use futures::stream::{self, BoxStream};
 
 use crate::error::Result;
 
 pub mod anthropic;
 pub mod openai;
-pub mod routing;
+pub mod registry;
 
 /// A streaming response body: a sequence of byte chunks.
 pub type BodyStream = BoxStream<'static, std::result::Result<Bytes, std::io::Error>>;
 
+/// Wrap a complete, in-memory body as a single-chunk stream.
+pub(crate) fn single_chunk(bytes: Vec<u8>) -> BodyStream {
+    stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(bytes)) }).boxed()
+}
+
 /// A chat completion request flowing through the gateway.
 pub struct ChatRequest {
-    /// The model the caller requested.
+    /// The upstream model to send. The registry rewrites this per route.
     pub model: String,
     /// Whether the caller asked for a streamed (SSE) response.
     pub stream: bool,

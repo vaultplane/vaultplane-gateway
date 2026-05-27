@@ -1,10 +1,11 @@
 //! OpenAI and OpenAI-compatible provider connector.
 //!
 //! Forwards a request to the configured base URL with the provider API key swapped
-//! in, and streams the response back without buffering. The Anthropic, Azure OpenAI,
-//! and Bedrock connectors will follow the same trait.
+//! in and the request body's `model` rewritten to the route's upstream model, then
+//! streams the response back without buffering.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::StreamExt;
 
 use crate::error::{Error, Result};
@@ -31,6 +32,24 @@ impl OpenAiConnector {
     }
 }
 
+/// Rewrite the `model` field of a JSON request body. Returns the body unchanged if
+/// it is not a JSON object.
+fn rewrite_model(body: &Bytes, model: &str) -> Vec<u8> {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(model.to_string()),
+                );
+                return serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec());
+            }
+            body.to_vec()
+        }
+        Err(_) => body.to_vec(),
+    }
+}
+
 #[async_trait]
 impl Connector for OpenAiConnector {
     fn name(&self) -> &str {
@@ -44,7 +63,7 @@ impl Connector for OpenAiConnector {
             .post(&url)
             .bearer_auth(&self.api_key)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(request.body)
+            .body(rewrite_model(&request.body, &request.model))
             .send()
             .await
             .map_err(|e| Error::Provider(format!("request to OpenAI failed: {e}")))?;
