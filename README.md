@@ -41,12 +41,19 @@ Performance numbers will always be published with context.
 
 ## Build from source
 
-VaultPlane Gateway is written in Rust. The runtime is not yet implemented; once
-the workspace lands, you will build and run the data plane with:
+VaultPlane Gateway is written in Rust. Build and run the data plane with:
 
 ```bash
 cargo run -p vaultplane
 ```
+
+This starts the proxy listener (default port 8080) and the admin listener
+(default port 9091). The admin API serves liveness, readiness, and status at
+`/admin/healthz`, `/admin/readyz`, and `/admin/status`. The proxy endpoints
+return 501 for now while the provider connectors and routing are built.
+
+Configuration is layered: defaults, then an optional YAML file passed with
+`--config`, then environment variables prefixed `VAULTPLANE_`.
 
 ## VaultPlane: two planes
 
