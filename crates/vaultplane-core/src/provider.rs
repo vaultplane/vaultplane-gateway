@@ -15,8 +15,10 @@ use crate::error::Result;
 
 pub mod anthropic;
 pub mod azure;
+pub mod bedrock;
 pub mod openai;
 pub mod registry;
+pub(crate) mod sigv4;
 
 /// A streaming response body: a sequence of byte chunks.
 pub type BodyStream = BoxStream<'static, std::result::Result<Bytes, std::io::Error>>;

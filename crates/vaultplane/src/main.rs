@@ -21,6 +21,7 @@ use vaultplane_core::config::Config;
 use vaultplane_core::provider::Connector;
 use vaultplane_core::provider::anthropic::AnthropicConnector;
 use vaultplane_core::provider::azure::AzureConnector;
+use vaultplane_core::provider::bedrock::BedrockConnector;
 use vaultplane_core::provider::openai::OpenAiConnector;
 use vaultplane_core::provider::registry::Registry;
 
@@ -79,6 +80,12 @@ fn read_key(var: &str, provider: &str) -> String {
     key
 }
 
+/// Read an optional environment variable, returning `None` when unset or empty.
+fn optional_env(var: &str) -> Option<String> {
+    let value = std::env::var(var).unwrap_or_default();
+    if value.is_empty() { None } else { Some(value) }
+}
+
 /// Build the provider connectors and the model registry from configuration.
 fn build_router(config: &Config) -> anyhow::Result<Arc<dyn Connector>> {
     let openai_cfg = &config.providers.openai;
@@ -109,10 +116,22 @@ fn build_router(config: &Config) -> anyhow::Result<Arc<dyn Connector>> {
         .context("failed to build Azure OpenAI connector")?,
     );
 
+    let bedrock_cfg = &config.providers.bedrock;
+    let bedrock: Arc<dyn Connector> = Arc::new(
+        BedrockConnector::new(
+            bedrock_cfg.region.clone(),
+            read_key(&bedrock_cfg.access_key_env, "bedrock"),
+            std::env::var(&bedrock_cfg.secret_key_env).unwrap_or_default(),
+            optional_env(&bedrock_cfg.session_token_env),
+        )
+        .context("failed to build Bedrock connector")?,
+    );
+
     let connectors = HashMap::from([
         ("openai".to_string(), openai),
         ("anthropic".to_string(), anthropic),
         ("azure".to_string(), azure),
+        ("bedrock".to_string(), bedrock),
     ]);
     let registry =
         Registry::new(connectors, &config.models).context("failed to build model registry")?;

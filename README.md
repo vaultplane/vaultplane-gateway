@@ -58,7 +58,10 @@ connector errors, and timeouts. A model that is not in the registry routes by na
 prefix (`claude` models to Anthropic, everything else to OpenAI). Set
 `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `AZURE_OPENAI_API_KEY` as needed. Azure
 OpenAI is reached through a registry route (provider `azure`), where the route model
-is the Azure deployment name and the resource `base_url` is configured. OpenAI
+is the Azure deployment name and the resource `base_url` is configured. AWS Bedrock
+(provider `bedrock`, Anthropic models) is reached the same way, with the route model
+as the Bedrock model id; it uses the standard AWS credential environment variables
+and SigV4 signing. OpenAI
 responses stream through
 unchanged; Anthropic requests and non-streaming responses are translated to and
 from the OpenAI schema (Anthropic streaming is not yet supported). `/v1/embeddings`

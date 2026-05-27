@@ -59,6 +59,8 @@ pub struct Providers {
     pub anthropic: AnthropicProvider,
     /// Azure OpenAI.
     pub azure: AzureProvider,
+    /// AWS Bedrock.
+    pub bedrock: BedrockProvider,
 }
 
 /// Configuration for the OpenAI-compatible provider.
@@ -117,6 +119,31 @@ impl Default for AzureProvider {
             base_url: String::new(),
             api_key_env: "AZURE_OPENAI_API_KEY".to_string(),
             api_version: "2024-10-21".to_string(),
+        }
+    }
+}
+
+/// Configuration for the AWS Bedrock provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BedrockProvider {
+    /// AWS region, for example `us-east-1`.
+    pub region: String,
+    /// Environment variable holding the AWS access key id.
+    pub access_key_env: String,
+    /// Environment variable holding the AWS secret access key.
+    pub secret_key_env: String,
+    /// Environment variable holding the AWS session token (optional credentials).
+    pub session_token_env: String,
+}
+
+impl Default for BedrockProvider {
+    fn default() -> Self {
+        Self {
+            region: "us-east-1".to_string(),
+            access_key_env: "AWS_ACCESS_KEY_ID".to_string(),
+            secret_key_env: "AWS_SECRET_ACCESS_KEY".to_string(),
+            session_token_env: "AWS_SESSION_TOKEN".to_string(),
         }
     }
 }
@@ -214,6 +241,8 @@ mod tests {
             assert_eq!(cfg.providers.azure.api_key_env, "AZURE_OPENAI_API_KEY");
             assert_eq!(cfg.providers.azure.api_version, "2024-10-21");
             assert!(cfg.providers.azure.base_url.is_empty());
+            assert_eq!(cfg.providers.bedrock.region, "us-east-1");
+            assert_eq!(cfg.providers.bedrock.access_key_env, "AWS_ACCESS_KEY_ID");
             assert_eq!(cfg.auth.admin_token_env, "VAULTPLANE_ADMIN_TOKEN");
             assert!(cfg.auth.keys.is_empty());
             assert!(cfg.models.is_empty());

@@ -6,6 +6,9 @@
 //! the response, finish reason, and token usage are mapped back to the OpenAI shape.
 //! The upstream model comes from the route, not the request body.
 //!
+//! The schema transform (`parse_openai_messages`, `to_openai_response`) is shared
+//! with the Bedrock connector, which speaks the same Anthropic Messages schema.
+//!
 //! Streaming requests are not yet supported (they return 501). Multimodal (array)
 //! message content is not yet supported.
 
@@ -42,6 +45,21 @@ impl AnthropicConnector {
     }
 }
 
+/// A message in the Anthropic Messages schema. Shared with the Bedrock connector.
+#[derive(Serialize)]
+pub(crate) struct Message {
+    pub role: String,
+    pub content: String,
+}
+
+/// An OpenAI Chat Completions request normalized for the Anthropic Messages schema.
+pub(crate) struct ChatMessages {
+    pub system: Option<String>,
+    pub messages: Vec<Message>,
+    pub max_tokens: u32,
+    pub temperature: Option<f64>,
+}
+
 // Incoming OpenAI Chat Completions request (the subset we read).
 #[derive(Deserialize)]
 struct OpenAiRequest {
@@ -60,22 +78,46 @@ struct OpenAiMessage {
     content: String,
 }
 
+/// Parse an OpenAI Chat Completions body, hoisting system messages and applying the
+/// default `max_tokens`.
+pub(crate) fn parse_openai_messages(body: &[u8]) -> Result<ChatMessages> {
+    let request: OpenAiRequest = serde_json::from_slice(body)
+        .map_err(|e| Error::Provider(format!("invalid chat request: {e}")))?;
+
+    let mut system = String::new();
+    let mut messages = Vec::new();
+    for message in request.messages {
+        if message.role == "system" {
+            if !system.is_empty() {
+                system.push('\n');
+            }
+            system.push_str(&message.content);
+        } else {
+            messages.push(Message {
+                role: message.role,
+                content: message.content,
+            });
+        }
+    }
+
+    Ok(ChatMessages {
+        system: (!system.is_empty()).then_some(system),
+        messages,
+        max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        temperature: request.temperature,
+    })
+}
+
 // Outgoing Anthropic Messages request.
 #[derive(Serialize)]
 struct AnthropicRequest {
     model: String,
-    messages: Vec<AnthropicMessage>,
+    messages: Vec<Message>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
-}
-
-#[derive(Serialize)]
-struct AnthropicMessage {
-    role: String,
-    content: String,
 }
 
 // Incoming Anthropic Messages response (the subset we map).
@@ -109,37 +151,6 @@ struct AnthropicUsage {
     output_tokens: u32,
 }
 
-/// Translate an OpenAI Chat Completions body into an Anthropic Messages request for
-/// the given upstream model.
-fn to_anthropic_request(body: &[u8], model: &str) -> Result<AnthropicRequest> {
-    let request: OpenAiRequest = serde_json::from_slice(body)
-        .map_err(|e| Error::Provider(format!("invalid chat request: {e}")))?;
-
-    let mut system = String::new();
-    let mut messages = Vec::new();
-    for message in request.messages {
-        if message.role == "system" {
-            if !system.is_empty() {
-                system.push('\n');
-            }
-            system.push_str(&message.content);
-        } else {
-            messages.push(AnthropicMessage {
-                role: message.role,
-                content: message.content,
-            });
-        }
-    }
-
-    Ok(AnthropicRequest {
-        model: model.to_string(),
-        messages,
-        max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-        system: (!system.is_empty()).then_some(system),
-        temperature: request.temperature,
-    })
-}
-
 /// Map an Anthropic stop reason to an OpenAI finish reason.
 fn finish_reason(stop_reason: Option<&str>) -> &'static str {
     match stop_reason {
@@ -149,7 +160,8 @@ fn finish_reason(stop_reason: Option<&str>) -> &'static str {
 }
 
 /// Translate an Anthropic Messages response into an OpenAI Chat Completions response.
-fn to_openai_response(body: &[u8]) -> Result<Vec<u8>> {
+/// Shared with the Bedrock connector.
+pub(crate) fn to_openai_response(body: &[u8]) -> Result<Vec<u8>> {
     let response: AnthropicResponse = serde_json::from_slice(body)
         .map_err(|e| Error::Provider(format!("invalid Anthropic response: {e}")))?;
 
@@ -205,8 +217,15 @@ impl Connector for AnthropicConnector {
             });
         }
 
-        let payload = serde_json::to_vec(&to_anthropic_request(&request.body, &request.model)?)
-            .map_err(|e| Error::Provider(format!("failed to encode request: {e}")))?;
+        let parts = parse_openai_messages(&request.body)?;
+        let payload = serde_json::to_vec(&AnthropicRequest {
+            model: request.model.clone(),
+            messages: parts.messages,
+            max_tokens: parts.max_tokens,
+            system: parts.system,
+            temperature: parts.temperature,
+        })
+        .map_err(|e| Error::Provider(format!("failed to encode request: {e}")))?;
 
         let url = format!("{}/v1/messages", self.base_url);
         let response = self
