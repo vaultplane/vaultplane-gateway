@@ -1,18 +1,22 @@
 //! VaultPlane Gateway data plane entry point.
 //!
-//! Loads layered configuration, binds the OpenAI-compatible proxy API and the admin
-//! API on their configured ports, and serves until a shutdown signal arrives. The
-//! proxy endpoints are stubs that return 501 until the connectors and routing land.
+//! Loads layered configuration, builds the provider connector, binds the
+//! OpenAI-compatible proxy API and the admin API, and serves until a shutdown
+//! signal arrives. `POST /v1/chat/completions` proxies to OpenAI; the remaining
+//! proxy endpoints are stubs.
 
 mod admin;
 mod proxy;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
 use tokio::net::TcpListener;
 use vaultplane_core::config::Config;
+use vaultplane_core::provider::Connector;
+use vaultplane_core::provider::openai::OpenAiConnector;
 
 use crate::admin::AppState;
 
@@ -47,6 +51,21 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+/// Build the upstream provider connector from configuration.
+fn build_connector(config: &Config) -> anyhow::Result<Arc<dyn Connector>> {
+    let openai = &config.providers.openai;
+    let api_key = std::env::var(&openai.api_key_env).unwrap_or_default();
+    if api_key.is_empty() {
+        tracing::warn!(
+            var = %openai.api_key_env,
+            "OpenAI API key is not set; /v1/chat/completions will return 502"
+        );
+    }
+    let connector = OpenAiConnector::new(openai.base_url.clone(), api_key)
+        .context("failed to build OpenAI connector")?;
+    Ok(Arc::new(connector))
+}
+
 async fn run(config: Config) -> anyhow::Result<()> {
     let proxy_addr: SocketAddr = config
         .listen
@@ -60,6 +79,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         )
     })?;
 
+    let connector = build_connector(&config)?;
     let state = AppState::new(config);
 
     let proxy_listener = TcpListener::bind(proxy_addr)
@@ -75,7 +95,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // Configuration is loaded and both listeners are bound: ready to serve.
     state.set_ready(true);
 
-    let proxy_app = proxy::router();
+    let proxy_app = proxy::router(connector);
     let admin_app = admin::router(state);
 
     // Broadcast a single shutdown signal to both servers for a graceful drain.

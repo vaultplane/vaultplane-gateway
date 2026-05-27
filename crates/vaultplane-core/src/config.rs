@@ -21,6 +21,8 @@ use crate::error::{Error, Result};
 pub struct Config {
     /// Listener addresses for the proxy and admin APIs.
     pub listen: Listen,
+    /// Upstream provider configuration.
+    pub providers: Providers,
 }
 
 /// Listener addresses.
@@ -38,6 +40,33 @@ impl Default for Listen {
         Self {
             address: "0.0.0.0:8080".to_string(),
             admin_address: "0.0.0.0:9091".to_string(),
+        }
+    }
+}
+
+/// Upstream provider configuration. One provider family for now.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Providers {
+    /// OpenAI and OpenAI-compatible self-hosted servers.
+    pub openai: OpenAiProvider,
+}
+
+/// Configuration for the OpenAI-compatible provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpenAiProvider {
+    /// Base URL of the OpenAI-compatible API.
+    pub base_url: String,
+    /// Name of the environment variable that holds the API key.
+    pub api_key_env: String,
+}
+
+impl Default for OpenAiProvider {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.openai.com".to_string(),
+            api_key_env: "OPENAI_API_KEY".to_string(),
         }
     }
 }
@@ -69,6 +98,8 @@ mod tests {
             let cfg = Config::load(None).unwrap();
             assert_eq!(cfg.listen.address, "0.0.0.0:8080");
             assert_eq!(cfg.listen.admin_address, "0.0.0.0:9091");
+            assert_eq!(cfg.providers.openai.base_url, "https://api.openai.com");
+            assert_eq!(cfg.providers.openai.api_key_env, "OPENAI_API_KEY");
 
             // A YAML file overrides one field; the other keeps its default.
             jail.create_file("vp.yaml", "listen:\n  address: \"127.0.0.1:9000\"\n")?;
@@ -76,11 +107,17 @@ mod tests {
             assert_eq!(cfg.listen.address, "127.0.0.1:9000");
             assert_eq!(cfg.listen.admin_address, "0.0.0.0:9091");
 
-            // An environment variable overrides on top of the file.
+            // Environment variables override on top of the file, including nested
+            // provider fields.
             jail.set_env("VAULTPLANE_LISTEN__ADMIN_ADDRESS", "127.0.0.1:9100");
+            jail.set_env(
+                "VAULTPLANE_PROVIDERS__OPENAI__BASE_URL",
+                "http://localhost:1234",
+            );
             let cfg = Config::load(Some(Path::new("vp.yaml"))).unwrap();
             assert_eq!(cfg.listen.address, "127.0.0.1:9000");
             assert_eq!(cfg.listen.admin_address, "127.0.0.1:9100");
+            assert_eq!(cfg.providers.openai.base_url, "http://localhost:1234");
 
             Ok(())
         });

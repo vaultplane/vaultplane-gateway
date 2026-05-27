@@ -25,3 +25,4 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
+wiremock.workspace = true

@@ -49,8 +49,12 @@ cargo run -p vaultplane
 
 This starts the proxy listener (default port 8080) and the admin listener
 (default port 9091). The admin API serves liveness, readiness, and status at
-`/admin/healthz`, `/admin/readyz`, and `/admin/status`. The proxy endpoints
-return 501 for now while the provider connectors and routing are built.
+`/admin/healthz`, `/admin/readyz`, and `/admin/status`.
+
+`POST /v1/chat/completions` proxies to OpenAI: set the `OPENAI_API_KEY`
+environment variable, then send an OpenAI Chat Completions request (streaming or
+non-streaming) to the proxy port. `/v1/embeddings` and `/v1/models` return 501
+for now.
 
 Configuration is layered: defaults, then an optional YAML file passed with
 `--config`, then environment variables prefixed `VAULTPLANE_`.
