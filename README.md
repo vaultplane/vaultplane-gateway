@@ -56,7 +56,10 @@ resolved through the configured model registry: a virtual model name maps to a
 primary provider plus ordered fallbacks, with failover on retryable status codes,
 connector errors, and timeouts. A model that is not in the registry routes by name
 prefix (`claude` models to Anthropic, everything else to OpenAI). Set
-`OPENAI_API_KEY` and `ANTHROPIC_API_KEY` as needed. OpenAI responses stream through
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `AZURE_OPENAI_API_KEY` as needed. Azure
+OpenAI is reached through a registry route (provider `azure`), where the route model
+is the Azure deployment name and the resource `base_url` is configured. OpenAI
+responses stream through
 unchanged; Anthropic requests and non-streaming responses are translated to and
 from the OpenAI schema (Anthropic streaming is not yet supported). `/v1/embeddings`
 and `/v1/models` return 501 for now.

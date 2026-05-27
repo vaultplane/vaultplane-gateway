@@ -14,6 +14,7 @@ use futures::stream::{self, BoxStream};
 use crate::error::Result;
 
 pub mod anthropic;
+pub mod azure;
 pub mod openai;
 pub mod registry;
 

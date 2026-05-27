@@ -57,6 +57,8 @@ pub struct Providers {
     pub openai: OpenAiProvider,
     /// Anthropic.
     pub anthropic: AnthropicProvider,
+    /// Azure OpenAI.
+    pub azure: AzureProvider,
 }
 
 /// Configuration for the OpenAI-compatible provider.
@@ -93,6 +95,28 @@ impl Default for AnthropicProvider {
         Self {
             base_url: "https://api.anthropic.com".to_string(),
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
+        }
+    }
+}
+
+/// Configuration for the Azure OpenAI provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AzureProvider {
+    /// Resource base URL, for example `https://my-resource.openai.azure.com`.
+    pub base_url: String,
+    /// Name of the environment variable that holds the API key.
+    pub api_key_env: String,
+    /// Azure OpenAI API version (a query parameter on every request).
+    pub api_version: String,
+}
+
+impl Default for AzureProvider {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            api_key_env: "AZURE_OPENAI_API_KEY".to_string(),
+            api_version: "2024-10-21".to_string(),
         }
     }
 }
@@ -187,6 +211,9 @@ mod tests {
                 "https://api.anthropic.com"
             );
             assert_eq!(cfg.providers.anthropic.api_key_env, "ANTHROPIC_API_KEY");
+            assert_eq!(cfg.providers.azure.api_key_env, "AZURE_OPENAI_API_KEY");
+            assert_eq!(cfg.providers.azure.api_version, "2024-10-21");
+            assert!(cfg.providers.azure.base_url.is_empty());
             assert_eq!(cfg.auth.admin_token_env, "VAULTPLANE_ADMIN_TOKEN");
             assert!(cfg.auth.keys.is_empty());
             assert!(cfg.models.is_empty());

@@ -20,6 +20,7 @@ use vaultplane_core::auth::KeyStore;
 use vaultplane_core::config::Config;
 use vaultplane_core::provider::Connector;
 use vaultplane_core::provider::anthropic::AnthropicConnector;
+use vaultplane_core::provider::azure::AzureConnector;
 use vaultplane_core::provider::openai::OpenAiConnector;
 use vaultplane_core::provider::registry::Registry;
 
@@ -98,9 +99,20 @@ fn build_router(config: &Config) -> anyhow::Result<Arc<dyn Connector>> {
         .context("failed to build Anthropic connector")?,
     );
 
+    let azure_cfg = &config.providers.azure;
+    let azure: Arc<dyn Connector> = Arc::new(
+        AzureConnector::new(
+            azure_cfg.base_url.clone(),
+            read_key(&azure_cfg.api_key_env, "azure"),
+            azure_cfg.api_version.clone(),
+        )
+        .context("failed to build Azure OpenAI connector")?,
+    );
+
     let connectors = HashMap::from([
         ("openai".to_string(), openai),
         ("anthropic".to_string(), anthropic),
+        ("azure".to_string(), azure),
     ]);
     let registry =
         Registry::new(connectors, &config.models).context("failed to build model registry")?;
