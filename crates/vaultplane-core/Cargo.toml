@@ -15,9 +15,11 @@ figment.workspace = true
 futures.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 # Jail (isolated env + cwd for config tests) is behind figment's `test` feature.
 figment = { workspace = true, features = ["test"] }
 tokio = { workspace = true }
+wiremock = { workspace = true }

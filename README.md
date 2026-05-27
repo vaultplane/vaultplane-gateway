@@ -51,10 +51,13 @@ This starts the proxy listener (default port 8080) and the admin listener
 (default port 9091). The admin API serves liveness, readiness, and status at
 `/admin/healthz`, `/admin/readyz`, and `/admin/status`.
 
-`POST /v1/chat/completions` proxies to OpenAI: set the `OPENAI_API_KEY`
-environment variable, then send an OpenAI Chat Completions request (streaming or
-non-streaming) to the proxy port. `/v1/embeddings` and `/v1/models` return 501
-for now.
+`POST /v1/chat/completions` accepts the OpenAI Chat Completions schema and routes
+by model: `claude` models go to Anthropic, everything else to OpenAI. Set
+`OPENAI_API_KEY` and `ANTHROPIC_API_KEY` as needed. OpenAI responses stream
+through unchanged (streaming or non-streaming); Anthropic requests and
+non-streaming responses are translated to and from the OpenAI schema (Anthropic
+streaming is not yet supported). `/v1/embeddings` and `/v1/models` return 501 for
+now.
 
 Authentication: set `VAULTPLANE_ADMIN_TOKEN` to protect `/admin/status` (sent as
 `Authorization: Bearer <token>`); health and readiness stay open for probes.

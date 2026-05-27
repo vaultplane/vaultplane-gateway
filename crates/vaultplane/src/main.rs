@@ -18,7 +18,9 @@ use tokio::net::TcpListener;
 use vaultplane_core::auth::KeyStore;
 use vaultplane_core::config::Config;
 use vaultplane_core::provider::Connector;
+use vaultplane_core::provider::anthropic::AnthropicConnector;
 use vaultplane_core::provider::openai::OpenAiConnector;
+use vaultplane_core::provider::routing::RoutingConnector;
 
 use crate::admin::AppState;
 
@@ -62,19 +64,40 @@ pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-/// Build the upstream provider connector from configuration.
-fn build_connector(config: &Config) -> anyhow::Result<Arc<dyn Connector>> {
-    let openai = &config.providers.openai;
-    let api_key = std::env::var(&openai.api_key_env).unwrap_or_default();
-    if api_key.is_empty() {
+/// Read a provider API key from the named environment variable, warning if unset.
+fn read_key(var: &str, provider: &str) -> String {
+    let key = std::env::var(var).unwrap_or_default();
+    if key.is_empty() {
         tracing::warn!(
-            var = %openai.api_key_env,
-            "OpenAI API key is not set; /v1/chat/completions will return 502"
+            provider,
+            var,
+            "API key is not set; requests to this provider will fail"
         );
     }
-    let connector = OpenAiConnector::new(openai.base_url.clone(), api_key)
-        .context("failed to build OpenAI connector")?;
-    Ok(Arc::new(connector))
+    key
+}
+
+/// Build the upstream provider connectors from configuration and route by model.
+fn build_connector(config: &Config) -> anyhow::Result<Arc<dyn Connector>> {
+    let openai_cfg = &config.providers.openai;
+    let openai: Arc<dyn Connector> = Arc::new(
+        OpenAiConnector::new(
+            openai_cfg.base_url.clone(),
+            read_key(&openai_cfg.api_key_env, "openai"),
+        )
+        .context("failed to build OpenAI connector")?,
+    );
+
+    let anthropic_cfg = &config.providers.anthropic;
+    let anthropic: Arc<dyn Connector> = Arc::new(
+        AnthropicConnector::new(
+            anthropic_cfg.base_url.clone(),
+            read_key(&anthropic_cfg.api_key_env, "anthropic"),
+        )
+        .context("failed to build Anthropic connector")?,
+    );
+
+    Ok(Arc::new(RoutingConnector::new(openai, anthropic)))
 }
 
 /// Read the admin token from the configured environment variable.

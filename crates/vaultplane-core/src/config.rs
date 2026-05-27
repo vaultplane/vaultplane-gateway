@@ -53,6 +53,8 @@ impl Default for Listen {
 pub struct Providers {
     /// OpenAI and OpenAI-compatible self-hosted servers.
     pub openai: OpenAiProvider,
+    /// Anthropic.
+    pub anthropic: AnthropicProvider,
 }
 
 /// Configuration for the OpenAI-compatible provider.
@@ -70,6 +72,25 @@ impl Default for OpenAiProvider {
         Self {
             base_url: "https://api.openai.com".to_string(),
             api_key_env: "OPENAI_API_KEY".to_string(),
+        }
+    }
+}
+
+/// Configuration for the Anthropic provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnthropicProvider {
+    /// Base URL of the Anthropic Messages API.
+    pub base_url: String,
+    /// Name of the environment variable that holds the API key.
+    pub api_key_env: String,
+}
+
+impl Default for AnthropicProvider {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
         }
     }
 }
@@ -123,6 +144,11 @@ mod tests {
             assert_eq!(cfg.listen.admin_address, "0.0.0.0:9091");
             assert_eq!(cfg.providers.openai.base_url, "https://api.openai.com");
             assert_eq!(cfg.providers.openai.api_key_env, "OPENAI_API_KEY");
+            assert_eq!(
+                cfg.providers.anthropic.base_url,
+                "https://api.anthropic.com"
+            );
+            assert_eq!(cfg.providers.anthropic.api_key_env, "ANTHROPIC_API_KEY");
             assert_eq!(cfg.auth.admin_token_env, "VAULTPLANE_ADMIN_TOKEN");
             assert!(cfg.auth.keys.is_empty());
 

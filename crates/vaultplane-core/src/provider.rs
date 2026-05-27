@@ -12,7 +12,9 @@ use futures::stream::BoxStream;
 
 use crate::error::Result;
 
+pub mod anthropic;
 pub mod openai;
+pub mod routing;
 
 /// A streaming response body: a sequence of byte chunks.
 pub type BodyStream = BoxStream<'static, std::result::Result<Bytes, std::io::Error>>;
