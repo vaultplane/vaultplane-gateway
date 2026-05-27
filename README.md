@@ -56,6 +56,12 @@ environment variable, then send an OpenAI Chat Completions request (streaming or
 non-streaming) to the proxy port. `/v1/embeddings` and `/v1/models` return 501
 for now.
 
+Authentication: set `VAULTPLANE_ADMIN_TOKEN` to protect `/admin/status` (sent as
+`Authorization: Bearer <token>`); health and readiness stay open for probes.
+Configure virtual keys in the config file to require `Authorization: Bearer vp_<token>`
+on the proxy and to scope each key to specific models. With no keys configured the
+proxy is open, which is convenient for local development.
+
 Configuration is layered: defaults, then an optional YAML file passed with
 `--config`, then environment variables prefixed `VAULTPLANE_`.
 

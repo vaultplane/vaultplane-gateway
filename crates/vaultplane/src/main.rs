@@ -1,9 +1,8 @@
 //! VaultPlane Gateway data plane entry point.
 //!
-//! Loads layered configuration, builds the provider connector, binds the
-//! OpenAI-compatible proxy API and the admin API, and serves until a shutdown
-//! signal arrives. `POST /v1/chat/completions` proxies to OpenAI; the remaining
-//! proxy endpoints are stubs.
+//! Loads layered configuration, builds the provider connector and the virtual key
+//! store, binds the OpenAI-compatible proxy API and the admin API, and serves until
+//! a shutdown signal arrives.
 
 mod admin;
 mod proxy;
@@ -12,8 +11,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
+use axum::http::HeaderMap;
+use axum::http::header::AUTHORIZATION;
 use clap::Parser;
 use tokio::net::TcpListener;
+use vaultplane_core::auth::KeyStore;
 use vaultplane_core::config::Config;
 use vaultplane_core::provider::Connector;
 use vaultplane_core::provider::openai::OpenAiConnector;
@@ -51,6 +53,15 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+/// Extract a `Bearer` token from an `Authorization` header, if present.
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
 /// Build the upstream provider connector from configuration.
 fn build_connector(config: &Config) -> anyhow::Result<Arc<dyn Connector>> {
     let openai = &config.providers.openai;
@@ -64,6 +75,20 @@ fn build_connector(config: &Config) -> anyhow::Result<Arc<dyn Connector>> {
     let connector = OpenAiConnector::new(openai.base_url.clone(), api_key)
         .context("failed to build OpenAI connector")?;
     Ok(Arc::new(connector))
+}
+
+/// Read the admin token from the configured environment variable.
+fn read_admin_token(config: &Config) -> Option<String> {
+    let token = std::env::var(&config.auth.admin_token_env).unwrap_or_default();
+    if token.is_empty() {
+        tracing::warn!(
+            var = %config.auth.admin_token_env,
+            "admin token is not set; the admin status endpoint is unauthenticated"
+        );
+        None
+    } else {
+        Some(token)
+    }
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
@@ -80,7 +105,16 @@ async fn run(config: Config) -> anyhow::Result<()> {
     })?;
 
     let connector = build_connector(&config)?;
-    let state = AppState::new(config);
+    let admin_token = read_admin_token(&config);
+
+    let keys = Arc::new(KeyStore::new(config.auth.keys.clone()));
+    if keys.is_empty() {
+        tracing::warn!("no virtual keys configured; the proxy API is unauthenticated");
+    } else {
+        tracing::info!(count = keys.len(), "loaded virtual keys");
+    }
+
+    let state = AppState::new(config, admin_token);
 
     let proxy_listener = TcpListener::bind(proxy_addr)
         .await
@@ -95,7 +129,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // Configuration is loaded and both listeners are bound: ready to serve.
     state.set_ready(true);
 
-    let proxy_app = proxy::router(connector);
+    let proxy_app = proxy::router(connector, keys);
     let admin_app = admin::router(state);
 
     // Broadcast a single shutdown signal to both servers for a graceful drain.

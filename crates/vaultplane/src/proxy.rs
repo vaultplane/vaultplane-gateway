@@ -1,38 +1,66 @@
 //! OpenAI-compatible proxy API.
 //!
-//! `POST /v1/chat/completions` is forwarded to the configured provider and the
-//! response is streamed back to the client, so both buffered and streamed (SSE)
-//! replies pass through without buffering. `/v1/embeddings` and `/v1/models` are
-//! stubs that return 501 until they are implemented.
+//! Requests are authenticated against the virtual key store (when keys are
+//! configured) before routing. `POST /v1/chat/completions` enforces the key's model
+//! scope, then forwards to the provider and streams the response back without
+//! buffering. `/v1/embeddings` and `/v1/models` are stubs that return 501.
 
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::{Body, Bytes},
-    extract::State,
+    extract::{Request, State},
     http::{StatusCode, header::CONTENT_TYPE},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::json;
+use vaultplane_core::auth::{KeyStore, VirtualKey};
 use vaultplane_core::provider::{ChatRequest, Connector};
 
 /// Shared state for the proxy API.
 #[derive(Clone)]
 struct ProxyState {
     connector: Arc<dyn Connector>,
+    keys: Arc<KeyStore>,
 }
 
-/// Build the proxy API router around a provider connector.
-pub fn router(connector: Arc<dyn Connector>) -> Router {
+/// Build the proxy API router around a provider connector and key store.
+pub fn router(connector: Arc<dyn Connector>, keys: Arc<KeyStore>) -> Router {
+    let state = ProxyState { connector, keys };
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(not_implemented))
         .route("/v1/models", get(not_implemented))
         .fallback(fallback)
-        .with_state(ProxyState { connector })
+        .layer(middleware::from_fn_with_state(state.clone(), authenticate))
+        .with_state(state)
+}
+
+/// Authenticate a request against the virtual key store and attach the resolved key.
+///
+/// When no keys are configured the proxy is open and an anonymous key (which allows
+/// any model) is attached so downstream handlers have a uniform key to read.
+async fn authenticate(
+    State(state): State<ProxyState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let key = if state.keys.is_empty() {
+        VirtualKey::anonymous()
+    } else {
+        match crate::bearer_token(request.headers())
+            .and_then(|token| state.keys.authenticate(token).cloned())
+        {
+            Some(key) => key,
+            None => return error(StatusCode::UNAUTHORIZED, "missing or invalid virtual key"),
+        }
+    };
+    request.extensions_mut().insert(key);
+    next.run(request).await
 }
 
 /// The fields of a chat request the gateway reads before forwarding the rest.
@@ -43,10 +71,23 @@ struct ChatMeta {
     stream: bool,
 }
 
-async fn chat_completions(State(state): State<ProxyState>, body: Bytes) -> Response {
+async fn chat_completions(
+    State(state): State<ProxyState>,
+    Extension(key): Extension<VirtualKey>,
+    body: Bytes,
+) -> Response {
     let meta: ChatMeta = serde_json::from_slice(&body).unwrap_or_default();
+    let model = meta.model.unwrap_or_default();
+
+    if !key.allows_model(&model) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "virtual key is not allowed to use this model",
+        );
+    }
+
     let request = ChatRequest {
-        model: meta.model.unwrap_or_default(),
+        model,
         stream: meta.stream,
         body,
     };
@@ -88,6 +129,7 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
+    use vaultplane_core::auth::{KeyStore, VirtualKey};
     use vaultplane_core::provider::Connector;
     use vaultplane_core::provider::openai::OpenAiConnector;
     use wiremock::matchers::{header, method, path};
@@ -97,8 +139,32 @@ mod tests {
         Arc::new(OpenAiConnector::new(base_url, "test-key").unwrap())
     }
 
+    fn open() -> Arc<KeyStore> {
+        Arc::new(KeyStore::default())
+    }
+
+    fn store_with_key(models: &[&str]) -> Arc<KeyStore> {
+        let mut key = VirtualKey::anonymous();
+        key.token = "vp_test".to_string();
+        key.models = models.iter().map(|m| m.to_string()).collect();
+        Arc::new(KeyStore::new(vec![key]))
+    }
+
+    fn chat_request(token: Option<&str>, model: &str) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder
+            .body(Body::from(format!(r#"{{"model":"{model}"}}"#)))
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn chat_completions_proxies_to_upstream() {
+    async fn chat_completions_proxies_to_upstream_when_open() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -111,18 +177,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let app = router(connector(&server.uri()));
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"model":"gpt-4o"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let app = router(connector(&server.uri()), open());
+        let response = app.oneshot(chat_request(None, "gpt-4o")).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -132,8 +188,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_completions_requires_a_valid_key_when_configured() {
+        let app = router(connector("http://127.0.0.1:1"), store_with_key(&["gpt-4o"]));
+        let response = app.oneshot(chat_request(None, "gpt-4o")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn chat_completions_rejects_a_disallowed_model() {
+        let app = router(connector("http://127.0.0.1:1"), store_with_key(&["gpt-4o"]));
+        let response = app
+            .oneshot(chat_request(Some("vp_test"), "gpt-3.5"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn chat_completions_allows_an_allowed_model() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let app = router(connector(&server.uri()), store_with_key(&["gpt-4o"]));
+        let response = app
+            .oneshot(chat_request(Some("vp_test"), "gpt-4o"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn embeddings_is_not_implemented() {
-        let app = router(connector("http://127.0.0.1:1"));
+        let app = router(connector("http://127.0.0.1:1"), open());
         let response = app
             .oneshot(
                 Request::builder()
@@ -149,7 +239,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_route_is_not_found() {
-        let app = router(connector("http://127.0.0.1:1"));
+        let app = router(connector("http://127.0.0.1:1"), open());
         let response = app
             .oneshot(
                 Request::builder()

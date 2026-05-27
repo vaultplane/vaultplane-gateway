@@ -13,6 +13,7 @@ use figment::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::auth::VirtualKey;
 use crate::error::{Error, Result};
 
 /// Top-level gateway configuration.
@@ -23,6 +24,8 @@ pub struct Config {
     pub listen: Listen,
     /// Upstream provider configuration.
     pub providers: Providers,
+    /// Authentication configuration (admin token and virtual keys).
+    pub auth: Auth,
 }
 
 /// Listener addresses.
@@ -71,6 +74,26 @@ impl Default for OpenAiProvider {
     }
 }
 
+/// Authentication configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Auth {
+    /// Environment variable holding the admin API token. If unset, the admin API
+    /// privileged endpoints are unauthenticated.
+    pub admin_token_env: String,
+    /// Virtual keys accepted by the proxy API. If empty, the proxy is unauthenticated.
+    pub keys: Vec<VirtualKey>,
+}
+
+impl Default for Auth {
+    fn default() -> Self {
+        Self {
+            admin_token_env: "VAULTPLANE_ADMIN_TOKEN".to_string(),
+            keys: Vec::new(),
+        }
+    }
+}
+
 impl Config {
     /// Load configuration by layering defaults, an optional YAML file, and
     /// environment variables (prefixed `VAULTPLANE_`, nested keys split on `__`).
@@ -100,6 +123,8 @@ mod tests {
             assert_eq!(cfg.listen.admin_address, "0.0.0.0:9091");
             assert_eq!(cfg.providers.openai.base_url, "https://api.openai.com");
             assert_eq!(cfg.providers.openai.api_key_env, "OPENAI_API_KEY");
+            assert_eq!(cfg.auth.admin_token_env, "VAULTPLANE_ADMIN_TOKEN");
+            assert!(cfg.auth.keys.is_empty());
 
             // A YAML file overrides one field; the other keeps its default.
             jail.create_file("vp.yaml", "listen:\n  address: \"127.0.0.1:9000\"\n")?;
