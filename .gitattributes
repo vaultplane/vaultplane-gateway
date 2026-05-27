@@ -1,0 +1,10 @@
+# Normalize all text files to LF in the repository (consistent across OSes and CI).
+* text=auto eol=lf
+
+# Treat known binary artifacts as binary so git never tries to normalize them.
+*.wasm binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary

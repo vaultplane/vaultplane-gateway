@@ -1,0 +1,16 @@
+# Rust build artifacts
+/target/
+**/target/
+**/*.rs.bk
+
+# Note: Cargo.lock is intentionally committed (this workspace ships binaries).
+
+# Environment and secrets
+.env
+.env.*
+*.local
+
+# Editor and OS
+.idea/
+.DS_Store
+Thumbs.db
