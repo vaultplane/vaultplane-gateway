@@ -1,0 +1,13 @@
+[package]
+name = "vaultplane-core"
+description = "Shared types and runtime building blocks for the VaultPlane Gateway data plane."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vaultplane",
+    "crates/vaultplane-ctl",
+    "crates/vaultplane-core",
+    "crates/vaultplane-plugin-sdk",
+]
+exclude = [
+    # The reference PII plugin is a WebAssembly component built for a wasm32 target,
+    # not the host. It is built separately; see plugins/pii-redaction/README.md.
+    "plugins/pii-redaction",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/vaultplane/vaultplane-gateway"
+authors = ["VaultPlane"]
+
+[workspace.dependencies]
+# Internal crates.
+vaultplane-core = { path = "crates/vaultplane-core" }
+vaultplane-plugin-sdk = { path = "crates/vaultplane-plugin-sdk" }
+
+# Shared third-party dependencies. Versions are centralized here so every crate
+# stays in lockstep; individual crates opt in with `dep.workspace = true`.
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

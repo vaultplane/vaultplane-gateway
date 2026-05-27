@@ -1,0 +1,17 @@
+[package]
+name = "vaultplane-ctl"
+description = "Command-line tool for operating VaultPlane Gateway: virtual keys, config, models, and status."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "vaultplane-ctl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true

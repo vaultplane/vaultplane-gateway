@@ -1,0 +1,36 @@
+package vaultplane:plugin@0.1.0;
+
+/// Inline request inspection: the one plugin hook supported in the MVP.
+interface inspect {
+    /// A request as seen by the gateway before it is forwarded upstream.
+    record request {
+        method: string,
+        path: string,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// Why a request was rejected, and the status code to return to the client.
+    record reject-info {
+        reason: string,
+        status-code: u16,
+    }
+
+    /// The decision a plugin returns for a request.
+    variant action {
+        /// Forward the request unchanged.
+        pass,
+        /// Forward a modified request.
+        modify(request),
+        /// Reject the request with the given reason and status code.
+        reject(reject-info),
+    }
+
+    /// Inspect an inbound request and decide what the gateway should do with it.
+    inspect-request: func(req: request) -> action;
+}
+
+/// The world a VaultPlane inline plugin implements.
+world plugin {
+    export inspect;
+}

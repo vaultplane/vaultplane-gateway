@@ -1,0 +1,11 @@
+[package]
+name = "vaultplane-plugin-sdk"
+description = "SDK and WIT contract for building VaultPlane Gateway inline plugins."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

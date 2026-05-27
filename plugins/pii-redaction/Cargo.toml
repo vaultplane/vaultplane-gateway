@@ -1,0 +1,15 @@
+[package]
+name = "pii-redaction"
+description = "Reference VaultPlane Gateway plugin that redacts common PII patterns inline."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/vaultplane/vaultplane-gateway"
+authors = ["VaultPlane"]
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]

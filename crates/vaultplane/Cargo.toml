@@ -1,0 +1,21 @@
+[package]
+name = "vaultplane"
+description = "VaultPlane Gateway data plane: a low-latency proxy that routes and governs AI model traffic."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "vaultplane"
+path = "src/main.rs"
+
+[dependencies]
+vaultplane-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
