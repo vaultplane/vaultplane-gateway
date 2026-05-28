@@ -6,6 +6,7 @@
 
 mod admin;
 mod proxy;
+mod telemetry;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -38,7 +39,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
+    let tracer_provider = telemetry::init()?;
 
     let args = Args::parse();
     let config = Config::load(args.config.as_deref().map(std::path::Path::new))
@@ -49,16 +50,9 @@ async fn main() -> anyhow::Result<()> {
         "VaultPlane Gateway starting"
     );
 
-    run(config).await
-}
-
-fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .init();
+    let result = run(config).await;
+    telemetry::shutdown(tracer_provider);
+    result
 }
 
 /// Extract a `Bearer` token from an `Authorization` header, if present.
