@@ -3,6 +3,9 @@
 //! Forwards a request to the configured base URL with the provider API key swapped
 //! in and the request body's `model` rewritten to the route's upstream model, then
 //! streams the response back without buffering.
+//!
+//! Token usage is not extracted from the streamed response body and is reported as
+//! `None`; capturing usage on the OpenAI passthrough path is a separate slice.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -84,6 +87,10 @@ impl Connector for OpenAiConnector {
             status,
             content_type,
             body,
+            provider: "openai".to_string(),
+            model: request.model,
+            usage: None,
+            attempts: 1,
         })
     }
 }

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::{Error, Result};
-use crate::provider::{ChatRequest, ChatResponse, Connector, single_chunk};
+use crate::provider::{ChatRequest, ChatResponse, Connector, Usage, single_chunk};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
@@ -159,9 +159,10 @@ fn finish_reason(stop_reason: Option<&str>) -> &'static str {
     }
 }
 
-/// Translate an Anthropic Messages response into an OpenAI Chat Completions response.
-/// Shared with the Bedrock connector.
-pub(crate) fn to_openai_response(body: &[u8]) -> Result<Vec<u8>> {
+/// Translate an Anthropic Messages response into an OpenAI Chat Completions response,
+/// returning the encoded body together with the extracted token usage. Shared with
+/// the Bedrock connector.
+pub(crate) fn to_openai_response(body: &[u8]) -> Result<(Vec<u8>, Usage)> {
     let response: AnthropicResponse = serde_json::from_slice(body)
         .map_err(|e| Error::Provider(format!("invalid Anthropic response: {e}")))?;
 
@@ -172,7 +173,11 @@ pub(crate) fn to_openai_response(body: &[u8]) -> Result<Vec<u8>> {
         .map(|block| block.text.as_str())
         .collect();
 
-    let usage = response.usage.unwrap_or_default();
+    let upstream_usage = response.usage.unwrap_or_default();
+    let usage = Usage {
+        prompt_tokens: upstream_usage.input_tokens,
+        completion_tokens: upstream_usage.output_tokens,
+    };
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -189,14 +194,15 @@ pub(crate) fn to_openai_response(body: &[u8]) -> Result<Vec<u8>> {
             "finish_reason": finish_reason(response.stop_reason.as_deref()),
         }],
         "usage": {
-            "prompt_tokens": usage.input_tokens,
-            "completion_tokens": usage.output_tokens,
-            "total_tokens": usage.input_tokens + usage.output_tokens,
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.prompt_tokens + usage.completion_tokens,
         },
     });
 
-    serde_json::to_vec(&openai)
-        .map_err(|e| Error::Provider(format!("failed to encode response: {e}")))
+    let encoded = serde_json::to_vec(&openai)
+        .map_err(|e| Error::Provider(format!("failed to encode response: {e}")))?;
+    Ok((encoded, usage))
 }
 
 #[async_trait]
@@ -214,6 +220,10 @@ impl Connector for AnthropicConnector {
                 status: 501,
                 content_type: Some("application/json".to_string()),
                 body: single_chunk(serde_json::to_vec(&body).unwrap_or_default()),
+                provider: "anthropic".to_string(),
+                model: request.model,
+                usage: None,
+                attempts: 1,
             });
         }
 
@@ -246,16 +256,21 @@ impl Connector for AnthropicConnector {
             .map_err(|e| Error::Provider(format!("reading Anthropic response failed: {e}")))?;
 
         // Forward upstream errors as-is; only the success body needs translating.
-        let body = if status == 200 {
-            to_openai_response(&upstream_body)?
+        let (body, usage) = if status == 200 {
+            let (encoded, usage) = to_openai_response(&upstream_body)?;
+            (encoded, Some(usage))
         } else {
-            upstream_body.to_vec()
+            (upstream_body.to_vec(), None)
         };
 
         Ok(ChatResponse {
             status,
             content_type: Some("application/json".to_string()),
             body: single_chunk(body),
+            provider: "anthropic".to_string(),
+            model: request.model,
+            usage,
+            attempts: 1,
         })
     }
 }
@@ -320,13 +335,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status, 200);
+        let usage = response.usage.expect("usage is populated for Anthropic");
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 5);
         let out = collect(response.body).await;
         let value: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(value["object"], "chat.completion");
         assert_eq!(value["choices"][0]["message"]["content"], "hi there");
         assert_eq!(value["choices"][0]["finish_reason"], "stop");
-        assert_eq!(value["usage"]["prompt_tokens"], 10);
-        assert_eq!(value["usage"]["completion_tokens"], 5);
         assert_eq!(value["usage"]["total_tokens"], 15);
     }
 

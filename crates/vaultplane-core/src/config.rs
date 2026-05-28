@@ -5,6 +5,7 @@
 //! are applied by the binary on top of the loaded configuration. The schema is
 //! intentionally small today and grows with the runtime.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use figment::{
@@ -28,6 +29,8 @@ pub struct Config {
     pub auth: Auth,
     /// Virtual model registry: maps a model name to a primary provider and fallbacks.
     pub models: Vec<ModelConfig>,
+    /// Pricing table for cost accounting, keyed by provider then model.
+    pub pricing: Pricing,
 }
 
 /// Listener addresses.
@@ -204,6 +207,22 @@ fn default_timeout_ms() -> u64 {
     30_000
 }
 
+/// Pricing table used to compute per-request cost. Pricing is config-driven: an
+/// empty table means cost is not reported.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Pricing {
+    /// Per-provider, per-model token pricing.
+    pub providers: HashMap<String, HashMap<String, ModelPricing>>,
+}
+
+/// USD price per 1,000 input and output tokens for a single model.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ModelPricing {
+    pub input_per_1k_tokens_usd: f64,
+    pub output_per_1k_tokens_usd: f64,
+}
+
 impl Config {
     /// Load configuration by layering defaults, an optional YAML file, and
     /// environment variables (prefixed `VAULTPLANE_`, nested keys split on `__`).
@@ -246,6 +265,7 @@ mod tests {
             assert_eq!(cfg.auth.admin_token_env, "VAULTPLANE_ADMIN_TOKEN");
             assert!(cfg.auth.keys.is_empty());
             assert!(cfg.models.is_empty());
+            assert!(cfg.pricing.providers.is_empty());
 
             // A YAML file overrides one field; the other keeps its default.
             jail.create_file("vp.yaml", "listen:\n  address: \"127.0.0.1:9000\"\n")?;

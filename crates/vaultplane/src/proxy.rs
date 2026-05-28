@@ -1,11 +1,12 @@
 //! OpenAI-compatible proxy API.
 //!
-//! Requests are authenticated against the virtual key store (when keys are
-//! configured) before routing. `POST /v1/chat/completions` enforces the key's model
-//! scope, then forwards to the provider and streams the response back without
-//! buffering. `/v1/embeddings` and `/v1/models` are stubs that return 501.
+//! Each request is authenticated against the virtual key store, dispatched through
+//! the provider connector (typically the model registry), and recorded as a tracing
+//! span with OpenTelemetry GenAI semantic-convention attributes plus VaultPlane
+//! attributes (virtual key id, team, app, env, attempts, cost, status, duration).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     Extension, Json, Router,
@@ -19,18 +20,24 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use vaultplane_core::auth::{KeyStore, VirtualKey};
-use vaultplane_core::provider::{ChatRequest, Connector};
+use vaultplane_core::config::Pricing;
+use vaultplane_core::provider::{ChatRequest, Connector, Usage};
 
 /// Shared state for the proxy API.
 #[derive(Clone)]
 struct ProxyState {
     connector: Arc<dyn Connector>,
     keys: Arc<KeyStore>,
+    pricing: Arc<Pricing>,
 }
 
-/// Build the proxy API router around a provider connector and key store.
-pub fn router(connector: Arc<dyn Connector>, keys: Arc<KeyStore>) -> Router {
-    let state = ProxyState { connector, keys };
+/// Build the proxy API router around a provider connector, key store, and pricing.
+pub fn router(connector: Arc<dyn Connector>, keys: Arc<KeyStore>, pricing: Arc<Pricing>) -> Router {
+    let state = ProxyState {
+        connector,
+        keys,
+        pricing,
+    };
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(not_implemented))
@@ -71,15 +78,43 @@ struct ChatMeta {
     stream: bool,
 }
 
+/// Compute the request cost in USD from upstream usage and the pricing table.
+fn compute_cost(pricing: &Pricing, provider: &str, model: &str, usage: &Usage) -> Option<f64> {
+    let model_pricing = pricing.providers.get(provider)?.get(model)?;
+    let input = (usage.prompt_tokens as f64) / 1000.0 * model_pricing.input_per_1k_tokens_usd;
+    let output = (usage.completion_tokens as f64) / 1000.0 * model_pricing.output_per_1k_tokens_usd;
+    Some(input + output)
+}
+
 async fn chat_completions(
     State(state): State<ProxyState>,
     Extension(key): Extension<VirtualKey>,
     body: Bytes,
 ) -> Response {
+    let start = Instant::now();
     let meta: ChatMeta = serde_json::from_slice(&body).unwrap_or_default();
-    let model = meta.model.unwrap_or_default();
+    let virtual_model = meta.model.unwrap_or_default();
 
-    if !key.allows_model(&model) {
+    let span = tracing::info_span!(
+        "chat",
+        "gen_ai.system" = tracing::field::Empty,
+        "gen_ai.request.model" = %virtual_model,
+        "gen_ai.response.model" = tracing::field::Empty,
+        "gen_ai.usage.input_tokens" = tracing::field::Empty,
+        "gen_ai.usage.output_tokens" = tracing::field::Empty,
+        "vaultplane.virtual_key.id" = %key.id(),
+        "vaultplane.team" = %key.team,
+        "vaultplane.app" = %key.app,
+        "vaultplane.env" = %key.env,
+        "vaultplane.provider.attempts" = tracing::field::Empty,
+        "vaultplane.cost_usd" = tracing::field::Empty,
+        "http.response.status_code" = tracing::field::Empty,
+        "duration_ms" = tracing::field::Empty,
+    );
+
+    if !key.allows_model(&virtual_model) {
+        span.record("http.response.status_code", 403_u64);
+        span.record("duration_ms", start.elapsed().as_millis() as u64);
         return error(
             StatusCode::FORBIDDEN,
             "virtual key is not allowed to use this model",
@@ -87,13 +122,31 @@ async fn chat_completions(
     }
 
     let request = ChatRequest {
-        model,
+        model: virtual_model,
         stream: meta.stream,
         body,
     };
 
-    match state.connector.chat(request).await {
+    let result = state.connector.chat(request).await;
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match result {
         Ok(upstream) => {
+            span.record("gen_ai.system", upstream.provider.as_str());
+            span.record("gen_ai.response.model", upstream.model.as_str());
+            span.record("vaultplane.provider.attempts", upstream.attempts as u64);
+            span.record("http.response.status_code", upstream.status as u64);
+            if let Some(usage) = &upstream.usage {
+                span.record("gen_ai.usage.input_tokens", usage.prompt_tokens as u64);
+                span.record("gen_ai.usage.output_tokens", usage.completion_tokens as u64);
+                if let Some(cost) =
+                    compute_cost(&state.pricing, &upstream.provider, &upstream.model, usage)
+                {
+                    span.record("vaultplane.cost_usd", cost);
+                }
+            }
+            span.record("duration_ms", duration_ms);
+
             let mut builder = Response::builder().status(upstream.status);
             if let Some(content_type) = upstream.content_type {
                 builder = builder.header(CONTENT_TYPE, content_type);
@@ -104,6 +157,8 @@ async fn chat_completions(
         }
         Err(err) => {
             tracing::warn!(error = %err, "upstream chat completion failed");
+            span.record("http.response.status_code", 502_u64);
+            span.record("duration_ms", duration_ms);
             error(StatusCode::BAD_GATEWAY, "upstream request failed")
         }
     }
@@ -124,13 +179,15 @@ fn error(status: StatusCode, message: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::router;
+    use super::{compute_cost, router};
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
     use vaultplane_core::auth::{KeyStore, VirtualKey};
+    use vaultplane_core::config::{ModelPricing, Pricing};
     use vaultplane_core::provider::Connector;
+    use vaultplane_core::provider::Usage;
     use vaultplane_core::provider::openai::OpenAiConnector;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -139,8 +196,12 @@ mod tests {
         Arc::new(OpenAiConnector::new(base_url, "test-key").unwrap())
     }
 
-    fn open() -> Arc<KeyStore> {
+    fn open_keys() -> Arc<KeyStore> {
         Arc::new(KeyStore::default())
+    }
+
+    fn open_pricing() -> Arc<Pricing> {
+        Arc::new(Pricing::default())
     }
 
     fn store_with_key(models: &[&str]) -> Arc<KeyStore> {
@@ -163,6 +224,32 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn cost_is_computed_from_usage_and_pricing() {
+        let mut pricing = Pricing::default();
+        let mut openai = std::collections::HashMap::new();
+        openai.insert(
+            "gpt-4o".to_string(),
+            ModelPricing {
+                input_per_1k_tokens_usd: 2.5,
+                output_per_1k_tokens_usd: 10.0,
+            },
+        );
+        pricing.providers.insert("openai".to_string(), openai);
+
+        let usage = Usage {
+            prompt_tokens: 1_000,
+            completion_tokens: 500,
+        };
+        let cost = compute_cost(&pricing, "openai", "gpt-4o", &usage).unwrap();
+        // 1000/1000 * 2.5 + 500/1000 * 10.0 = 2.5 + 5.0 = 7.5
+        assert!((cost - 7.5).abs() < 1e-9);
+
+        // Unknown provider or model returns None.
+        assert!(compute_cost(&pricing, "openai", "unknown", &usage).is_none());
+        assert!(compute_cost(&pricing, "anthropic", "gpt-4o", &usage).is_none());
+    }
+
     #[tokio::test]
     async fn chat_completions_proxies_to_upstream_when_open() {
         let server = MockServer::start().await;
@@ -177,7 +264,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let app = router(connector(&server.uri()), open());
+        let app = router(connector(&server.uri()), open_keys(), open_pricing());
         let response = app.oneshot(chat_request(None, "gpt-4o")).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -189,14 +276,22 @@ mod tests {
 
     #[tokio::test]
     async fn chat_completions_requires_a_valid_key_when_configured() {
-        let app = router(connector("http://127.0.0.1:1"), store_with_key(&["gpt-4o"]));
+        let app = router(
+            connector("http://127.0.0.1:1"),
+            store_with_key(&["gpt-4o"]),
+            open_pricing(),
+        );
         let response = app.oneshot(chat_request(None, "gpt-4o")).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn chat_completions_rejects_a_disallowed_model() {
-        let app = router(connector("http://127.0.0.1:1"), store_with_key(&["gpt-4o"]));
+        let app = router(
+            connector("http://127.0.0.1:1"),
+            store_with_key(&["gpt-4o"]),
+            open_pricing(),
+        );
         let response = app
             .oneshot(chat_request(Some("vp_test"), "gpt-3.5"))
             .await
@@ -213,7 +308,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let app = router(connector(&server.uri()), store_with_key(&["gpt-4o"]));
+        let app = router(
+            connector(&server.uri()),
+            store_with_key(&["gpt-4o"]),
+            open_pricing(),
+        );
         let response = app
             .oneshot(chat_request(Some("vp_test"), "gpt-4o"))
             .await
@@ -223,7 +322,7 @@ mod tests {
 
     #[tokio::test]
     async fn embeddings_is_not_implemented() {
-        let app = router(connector("http://127.0.0.1:1"), open());
+        let app = router(connector("http://127.0.0.1:1"), open_keys(), open_pricing());
         let response = app
             .oneshot(
                 Request::builder()
@@ -239,7 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_route_is_not_found() {
-        let app = router(connector("http://127.0.0.1:1"), open());
+        let app = router(connector("http://127.0.0.1:1"), open_keys(), open_pricing());
         let response = app
             .oneshot(
                 Request::builder()

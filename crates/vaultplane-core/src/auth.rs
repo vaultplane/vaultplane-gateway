@@ -43,6 +43,19 @@ impl VirtualKey {
     pub fn allows_model(&self, model: &str) -> bool {
         self.models.is_empty() || self.models.iter().any(|m| m == "*" || m == model)
     }
+
+    /// A non-secret identifier for the key, safe to put in spans and logs.
+    ///
+    /// Returns `"anonymous"` when no token is set; otherwise returns the first 12
+    /// characters of the token followed by an ellipsis.
+    pub fn id(&self) -> String {
+        if self.token.is_empty() {
+            "anonymous".to_string()
+        } else {
+            let prefix: String = self.token.chars().take(12).collect();
+            format!("{prefix}...")
+        }
+    }
 }
 
 /// An in-memory lookup of virtual keys by token.

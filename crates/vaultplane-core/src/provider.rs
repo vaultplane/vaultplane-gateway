@@ -38,6 +38,15 @@ pub struct ChatRequest {
     pub body: Bytes,
 }
 
+/// Token usage reported by an upstream provider.
+#[derive(Debug, Clone, Copy)]
+pub struct Usage {
+    /// Tokens consumed by the prompt (input).
+    pub prompt_tokens: u32,
+    /// Tokens generated in the completion (output).
+    pub completion_tokens: u32,
+}
+
 /// A chat completion response from an upstream provider.
 pub struct ChatResponse {
     /// HTTP status returned by the upstream provider.
@@ -46,6 +55,15 @@ pub struct ChatResponse {
     pub content_type: Option<String>,
     /// The response body, streamed without buffering.
     pub body: BodyStream,
+    /// The provider family that served the request (`openai`, `anthropic`,
+    /// `azure`, `bedrock`).
+    pub provider: String,
+    /// The upstream model the request was sent to.
+    pub model: String,
+    /// Token usage, when the connector parses the response body.
+    pub usage: Option<Usage>,
+    /// Number of provider attempts made to produce this response (1 if no failover).
+    pub attempts: u32,
 }
 
 /// The contract every provider connector implements.

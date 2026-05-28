@@ -4,6 +4,9 @@
 //! shape: the model is an Azure *deployment* named in the URL path, the API key is
 //! sent in the `api-key` header, and the API version is a query parameter. Request
 //! and response bodies are the OpenAI schema, so they pass through unchanged.
+//!
+//! Token usage is not extracted from the streamed response body and is reported as
+//! `None`; capturing usage on the passthrough path is a separate slice.
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -76,6 +79,10 @@ impl Connector for AzureConnector {
             status,
             content_type,
             body,
+            provider: "azure".to_string(),
+            model: request.model,
+            usage: None,
+            attempts: 1,
         })
     }
 }

@@ -55,7 +55,10 @@ async fn main() -> anyhow::Result<()> {
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .init();
 }
 
 /// Extract a `Bearer` token from an `Authorization` header, if present.
@@ -178,6 +181,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
         tracing::info!(count = keys.len(), "loaded virtual keys");
     }
 
+    let pricing = Arc::new(config.pricing.clone());
+
     let state = AppState::new(config, admin_token);
 
     let proxy_listener = TcpListener::bind(proxy_addr)
@@ -193,7 +198,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // Configuration is loaded and both listeners are bound: ready to serve.
     state.set_ready(true);
 
-    let proxy_app = proxy::router(connector, keys);
+    let proxy_app = proxy::router(connector, keys, pricing);
     let admin_app = admin::router(state);
 
     // Broadcast a single shutdown signal to both servers for a graceful drain.

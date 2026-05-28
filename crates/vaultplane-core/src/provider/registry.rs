@@ -2,8 +2,9 @@
 //!
 //! A virtual model name resolves to a primary provider route plus ordered fallbacks.
 //! On a retryable status code, a connector error, or a timeout, the registry fails
-//! over to the next route, rewriting the request to that route's upstream model.
-//! Models that are not in the registry fall back to a provider chosen by name prefix.
+//! over to the next route, rewriting the request to that route's upstream model and
+//! tracking the attempt count on the returned response. Models that are not in the
+//! registry fall back to a provider chosen by name prefix.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -84,7 +85,8 @@ impl Registry {
     }
 }
 
-/// Try a model's routes in order, failing over on retryable outcomes.
+/// Try a model's routes in order, failing over on retryable outcomes. The returned
+/// response's `attempts` field reflects how many providers were tried.
 async fn dispatch(resolved: &ResolvedModel, request: ChatRequest) -> Result<ChatResponse> {
     let last = resolved.routes.len().saturating_sub(1);
     for (index, route) in resolved.routes.iter().enumerate() {
@@ -96,7 +98,7 @@ async fn dispatch(resolved: &ResolvedModel, request: ChatRequest) -> Result<Chat
         };
 
         match tokio::time::timeout(resolved.timeout, route.connector.chat(attempt)).await {
-            Ok(Ok(response)) => {
+            Ok(Ok(mut response)) => {
                 if !is_last && resolved.retry_on.contains(&response.status) {
                     tracing::warn!(
                         provider = route.connector.name(),
@@ -105,6 +107,7 @@ async fn dispatch(resolved: &ResolvedModel, request: ChatRequest) -> Result<Chat
                     );
                     continue;
                 }
+                response.attempts = (index + 1) as u32;
                 return Ok(response);
             }
             Ok(Err(err)) => {
@@ -196,12 +199,16 @@ mod tests {
             &self.name
         }
 
-        async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse> {
+        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ChatResponse {
                 status: self.status,
                 content_type: Some("application/json".to_string()),
                 body: single_chunk(self.body.clone().into_bytes()),
+                provider: self.name.clone(),
+                model: request.model,
+                usage: None,
+                attempts: 1,
             })
         }
     }
@@ -249,6 +256,7 @@ mod tests {
 
         let response = registry.chat(request("smart")).await.unwrap();
         assert_eq!(response.status, 200);
+        assert_eq!(response.attempts, 2);
         assert_eq!(c1.load(Ordering::SeqCst), 1);
         assert_eq!(c2.load(Ordering::SeqCst), 1);
     }
@@ -265,6 +273,7 @@ mod tests {
 
         let response = registry.chat(request("smart")).await.unwrap();
         assert_eq!(response.status, 200);
+        assert_eq!(response.attempts, 1);
         assert_eq!(c1.load(Ordering::SeqCst), 1);
         assert_eq!(c2.load(Ordering::SeqCst), 0);
     }
@@ -281,6 +290,7 @@ mod tests {
 
         let response = registry.chat(request("smart")).await.unwrap();
         assert_eq!(response.status, 400);
+        assert_eq!(response.attempts, 1);
         assert_eq!(c1.load(Ordering::SeqCst), 1);
         assert_eq!(c2.load(Ordering::SeqCst), 0);
     }

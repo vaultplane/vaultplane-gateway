@@ -106,6 +106,10 @@ impl Connector for BedrockConnector {
                 status: 501,
                 content_type: Some("application/json".to_string()),
                 body: single_chunk(serde_json::to_vec(&body).unwrap_or_default()),
+                provider: "bedrock".to_string(),
+                model: request.model,
+                usage: None,
+                attempts: 1,
             });
         }
 
@@ -162,16 +166,21 @@ impl Connector for BedrockConnector {
             .await
             .map_err(|e| Error::Provider(format!("reading Bedrock response failed: {e}")))?;
 
-        let body = if status == 200 {
-            to_openai_response(&upstream_body)?
+        let (body, usage) = if status == 200 {
+            let (encoded, usage) = to_openai_response(&upstream_body)?;
+            (encoded, Some(usage))
         } else {
-            upstream_body.to_vec()
+            (upstream_body.to_vec(), None)
         };
 
         Ok(ChatResponse {
             status,
             content_type: Some("application/json".to_string()),
             body: single_chunk(body),
+            provider: "bedrock".to_string(),
+            model: request.model,
+            usage,
+            attempts: 1,
         })
     }
 }
@@ -225,6 +234,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status, 200);
+        let usage = response.usage.expect("usage is populated for Bedrock");
+        assert_eq!(usage.prompt_tokens, 3);
+        assert_eq!(usage.completion_tokens, 2);
     }
 
     #[tokio::test]
