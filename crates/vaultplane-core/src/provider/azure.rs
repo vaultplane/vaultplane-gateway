@@ -5,14 +5,17 @@
 //! sent in the `api-key` header, and the API version is a query parameter. Request
 //! and response bodies are the OpenAI schema, so they pass through unchanged.
 //!
-//! Token usage is not extracted from the streamed response body and is reported as
-//! `None`; capturing usage on the passthrough path is a separate slice.
+//! For non-streaming responses the connector buffers the body and extracts the
+//! `usage` field. Streaming responses pass through unchanged without buffering;
+//! usage is not extracted on the streaming path.
 
 use async_trait::async_trait;
 use futures::StreamExt;
 
 use crate::error::{Error, Result};
-use crate::provider::{BodyStream, ChatRequest, ChatResponse, Connector};
+use crate::provider::{
+    BodyStream, ChatRequest, ChatResponse, Connector, parse_openai_usage, single_chunk,
+};
 
 /// Connector for Azure OpenAI deployments.
 pub struct AzureConnector {
@@ -70,6 +73,22 @@ impl Connector for AzureConnector {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
 
+        if !request.stream {
+            let upstream_body = response.bytes().await.map_err(|e| {
+                Error::Provider(format!("reading Azure OpenAI response failed: {e}"))
+            })?;
+            let usage = parse_openai_usage(&upstream_body);
+            return Ok(ChatResponse {
+                status,
+                content_type,
+                body: single_chunk(upstream_body.to_vec()),
+                provider: "azure".to_string(),
+                model: request.model,
+                usage,
+                attempts: 1,
+            });
+        }
+
         let body: BodyStream = response
             .bytes_stream()
             .map(|chunk| chunk.map_err(std::io::Error::other))
@@ -121,5 +140,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status, 200);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_response_includes_usage() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/deployments/prod-gpt4o/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"object":"chat.completion","usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}"#,
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let connector = AzureConnector::new(server.uri(), "test-key", "2024-10-21").unwrap();
+        let response = connector
+            .chat(ChatRequest {
+                model: "prod-gpt4o".to_string(),
+                stream: false,
+                body: Bytes::from_static(b"{}"),
+            })
+            .await
+            .unwrap();
+
+        let usage = response
+            .usage
+            .expect("usage on a non-streaming Azure response");
+        assert_eq!(usage.prompt_tokens, 4);
+        assert_eq!(usage.completion_tokens, 6);
     }
 }

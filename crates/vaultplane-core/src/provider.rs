@@ -28,6 +28,22 @@ pub(crate) fn single_chunk(bytes: Vec<u8>) -> BodyStream {
     stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(bytes)) }).boxed()
 }
 
+/// Extract token usage from an OpenAI-shaped Chat Completions response body.
+///
+/// Returns `None` if the body is not JSON or does not contain a `usage` object with
+/// `prompt_tokens` and `completion_tokens` numbers. Shared by the OpenAI and Azure
+/// connectors, which speak the same response schema.
+pub(crate) fn parse_openai_usage(body: &[u8]) -> Option<Usage> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let usage = value.get("usage")?;
+    let prompt_tokens = usage.get("prompt_tokens")?.as_u64()? as u32;
+    let completion_tokens = usage.get("completion_tokens")?.as_u64()? as u32;
+    Some(Usage {
+        prompt_tokens,
+        completion_tokens,
+    })
+}
+
 /// A chat completion request flowing through the gateway.
 pub struct ChatRequest {
     /// The upstream model to send. The registry rewrites this per route.

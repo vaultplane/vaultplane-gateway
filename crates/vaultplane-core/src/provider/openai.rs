@@ -1,18 +1,21 @@
 //! OpenAI and OpenAI-compatible provider connector.
 //!
 //! Forwards a request to the configured base URL with the provider API key swapped
-//! in and the request body's `model` rewritten to the route's upstream model, then
-//! streams the response back without buffering.
+//! in and the request body's `model` rewritten to the route's upstream model.
 //!
-//! Token usage is not extracted from the streamed response body and is reported as
-//! `None`; capturing usage on the OpenAI passthrough path is a separate slice.
+//! For non-streaming responses the connector buffers the body (bounded, kilobytes)
+//! and extracts the `usage` field, so cost and token counts are reported. Streaming
+//! responses pass through unchanged without buffering; usage is not extracted on the
+//! streaming path (that needs a tee-style observer on the SSE events).
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 
 use crate::error::{Error, Result};
-use crate::provider::{BodyStream, ChatRequest, ChatResponse, Connector};
+use crate::provider::{
+    BodyStream, ChatRequest, ChatResponse, Connector, parse_openai_usage, single_chunk,
+};
 
 /// Connector for the OpenAI REST API and OpenAI-compatible self-hosted servers.
 pub struct OpenAiConnector {
@@ -78,6 +81,25 @@ impl Connector for OpenAiConnector {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
 
+        if !request.stream {
+            // Non-streaming: buffer the bounded JSON body so we can extract usage.
+            let upstream_body = response
+                .bytes()
+                .await
+                .map_err(|e| Error::Provider(format!("reading OpenAI response failed: {e}")))?;
+            let usage = parse_openai_usage(&upstream_body);
+            return Ok(ChatResponse {
+                status,
+                content_type,
+                body: single_chunk(upstream_body.to_vec()),
+                provider: "openai".to_string(),
+                model: request.model,
+                usage,
+                attempts: 1,
+            });
+        }
+
+        // Streaming: pass chunks straight through; usage is not extracted today.
         let body: BodyStream = response
             .bytes_stream()
             .map(|chunk| chunk.map_err(std::io::Error::other))
@@ -100,6 +122,8 @@ mod tests {
     use super::OpenAiConnector;
     use crate::provider::{ChatRequest, Connector};
     use bytes::Bytes;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     async fn unreachable_upstream_is_an_error() {
@@ -111,5 +135,63 @@ mod tests {
             body: Bytes::from_static(b"{}"),
         };
         assert!(connector.chat(request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn non_streaming_response_includes_usage() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"object":"chat.completion","usage":{"prompt_tokens":7,"completion_tokens":11,"total_tokens":18}}"#,
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let connector = OpenAiConnector::new(server.uri(), "test-key").unwrap();
+        let response = connector
+            .chat(ChatRequest {
+                model: "gpt-4o".to_string(),
+                stream: false,
+                body: Bytes::from_static(b"{}"),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        let usage = response.usage.expect("usage on a non-streaming response");
+        assert_eq!(usage.prompt_tokens, 7);
+        assert_eq!(usage.completion_tokens, 11);
+    }
+
+    #[tokio::test]
+    async fn streaming_response_has_no_usage() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: {}\n\ndata: [DONE]\n\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let connector = OpenAiConnector::new(server.uri(), "test-key").unwrap();
+        let response = connector
+            .chat(ChatRequest {
+                model: "gpt-4o".to_string(),
+                stream: true,
+                body: Bytes::from_static(b"{}"),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert!(response.usage.is_none());
     }
 }
