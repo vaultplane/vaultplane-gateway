@@ -225,6 +225,8 @@ struct AnthropicTransform {
     chat_id: String,
     created: u64,
     model: String,
+    input_tokens: u32,
+    output_tokens: u32,
 }
 
 impl AnthropicTransform {
@@ -240,6 +242,8 @@ impl AnthropicTransform {
             chat_id,
             created,
             model,
+            input_tokens: 0,
+            output_tokens: 0,
         }
     }
 
@@ -259,6 +263,14 @@ impl AnthropicTransform {
                     .and_then(|m| m.as_str())
                 {
                     self.model = model.to_string();
+                }
+                if let Some(tokens) = data
+                    .get("message")
+                    .and_then(|m| m.get("usage"))
+                    .and_then(|u| u.get("input_tokens"))
+                    .and_then(|v| v.as_u64())
+                {
+                    self.input_tokens = tokens as u32;
                 }
                 out.push(self.chunk(json!({ "role": "assistant" }), None));
             }
@@ -282,7 +294,15 @@ impl AnthropicTransform {
                     .and_then(|d| d.get("stop_reason"))
                     .and_then(|v| v.as_str())
                     .map(map_finish_reason);
+                if let Some(tokens) = data
+                    .get("usage")
+                    .and_then(|u| u.get("output_tokens"))
+                    .and_then(|v| v.as_u64())
+                {
+                    self.output_tokens = tokens as u32;
+                }
                 out.push(self.chunk(json!({}), stop_reason));
+                out.push(self.usage_chunk());
             }
             // `message_stop`, `content_block_start`, `content_block_stop`, `ping`,
             // and any unknown events have no OpenAI equivalent and are dropped.
@@ -303,6 +323,25 @@ impl AnthropicTransform {
                 "delta": delta,
                 "finish_reason": finish_reason,
             }]
+        });
+        Bytes::from(format!("data: {chunk}\n\n").into_bytes())
+    }
+
+    /// Emit a final OpenAI-shape usage chunk (empty `choices`, top-level `usage`)
+    /// after the finish chunk so a downstream observer can pick up token totals.
+    fn usage_chunk(&self) -> Bytes {
+        let total = self.input_tokens + self.output_tokens;
+        let chunk = json!({
+            "id": self.chat_id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": self.input_tokens,
+                "completion_tokens": self.output_tokens,
+                "total_tokens": total,
+            }
         });
         Bytes::from(format!("data: {chunk}\n\n").into_bytes())
     }
@@ -582,6 +621,14 @@ mod tests {
         assert!(
             text.contains("chat.completion.chunk"),
             "missing chunk object: {text}"
+        );
+        assert!(
+            text.contains("\"prompt_tokens\":10"),
+            "missing usage chunk prompt_tokens: {text}"
+        );
+        assert!(
+            text.contains("\"completion_tokens\":5"),
+            "missing usage chunk completion_tokens: {text}"
         );
     }
 }

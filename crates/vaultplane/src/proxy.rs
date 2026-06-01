@@ -27,6 +27,7 @@ use vaultplane_core::auth::{KeyStore, RateLimiter, SpendTracker, VirtualKey};
 use vaultplane_core::cache::{CachedResponse, ResponseCache};
 use vaultplane_core::config::Pricing;
 use vaultplane_core::provider::{BodyStream, ChatRequest, Connector, Usage};
+use vaultplane_core::stream_observer::UsageObservingStream;
 
 const CACHE_HEADER: &str = "x-vaultplane-cache";
 
@@ -110,11 +111,11 @@ struct ChatMeta {
 }
 
 /// Compute the request cost in USD from upstream usage and the pricing table.
+///
+/// Thin wrapper over [`vaultplane_core::cost::compute`] so the streaming observer
+/// in core and the request handler here apply the same formula.
 fn compute_cost(pricing: &Pricing, provider: &str, model: &str, usage: &Usage) -> Option<f64> {
-    let model_pricing = pricing.providers.get(provider)?.get(model)?;
-    let input = (usage.prompt_tokens as f64) / 1000.0 * model_pricing.input_per_1k_tokens_usd;
-    let output = (usage.completion_tokens as f64) / 1000.0 * model_pricing.output_per_1k_tokens_usd;
-    Some(input + output)
+    vaultplane_core::cost::compute(pricing, provider, model, usage)
 }
 
 /// Drain a streaming body into a single contiguous buffer.
@@ -251,10 +252,28 @@ async fn chat_completions(
                     }
                 }
             } else {
+                // For streaming responses, observe SSE chunks for OpenAI-style
+                // `usage` and feed it back into the span and spend tracker. Cache
+                // hits and non-streaming responses have usage recorded above.
+                let body = if meta.stream {
+                    UsageObservingStream::new(
+                        upstream.body,
+                        span.clone(),
+                        state.pricing.clone(),
+                        state.spend_tracker.clone(),
+                        key.identifier(),
+                        key.spend_limit,
+                        upstream.provider.clone(),
+                        upstream.model.clone(),
+                    )
+                    .boxed()
+                } else {
+                    upstream.body
+                };
                 build_response(
                     upstream.status,
                     upstream.content_type.as_deref(),
-                    Body::from_stream(upstream.body),
+                    Body::from_stream(body),
                     "MISS",
                 )
             }
@@ -651,6 +670,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn streaming_usage_is_observed_and_charged_against_spend() {
+        let server = MockServer::start().await;
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":0,\"total_tokens\":1000}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let token = "vp_test";
+        let mut key = VirtualKey::anonymous();
+        key.id = "vp_stream_spend_id".to_string();
+        key.hash = hash_token(token);
+        key.spend_limit = Some(SpendLimit {
+            amount_usd: 0.5,
+            period: Period::Day,
+        });
+        let keys = Arc::new(KeyStore::new(vec![key]));
+
+        let mut pricing = Pricing::default();
+        let mut openai = std::collections::HashMap::new();
+        openai.insert(
+            "gpt-4o".to_string(),
+            ModelPricing {
+                input_per_1k_tokens_usd: 1.0,
+                output_per_1k_tokens_usd: 0.0,
+            },
+        );
+        pricing.providers.insert("openai".to_string(), openai);
+        let pricing = Arc::new(pricing);
+        let spend_tracker = Arc::new(SpendTracker::default());
+
+        let app = router(
+            connector(&server.uri()),
+            keys,
+            pricing,
+            no_cache(),
+            no_rate_limit(),
+            spend_tracker,
+        );
+
+        // Streaming request: drain the body so the SSE flows through the observer
+        // and the usage chunk is recorded against the spend tracker.
+        let streaming = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(r#"{"model":"gpt-4o","stream":true}"#))
+            .unwrap();
+        let first = app.clone().oneshot(streaming).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        // The streaming request reported $1 of usage, exceeding the $0.5/day budget.
+        // The next non-streaming request must be blocked with 402.
+        let second = app
+            .oneshot(chat_request(Some(token), "gpt-4o"))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::PAYMENT_REQUIRED);
     }
 
     #[tokio::test]

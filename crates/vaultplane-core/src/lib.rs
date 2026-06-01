@@ -9,9 +9,11 @@
 pub mod auth;
 pub mod cache;
 pub mod config;
+pub mod cost;
 pub mod error;
 pub mod provider;
 pub(crate) mod sse;
+pub mod stream_observer;
 
 pub use error::{Error, Result};
 
