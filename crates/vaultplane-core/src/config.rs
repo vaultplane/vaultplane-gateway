@@ -31,6 +31,8 @@ pub struct Config {
     pub models: Vec<ModelConfig>,
     /// Pricing table for cost accounting, keyed by provider then model.
     pub pricing: Pricing,
+    /// Exact-match response cache configuration.
+    pub cache: CacheConfig,
 }
 
 /// Listener addresses.
@@ -223,6 +225,28 @@ pub struct ModelPricing {
     pub output_per_1k_tokens_usd: f64,
 }
 
+/// Exact-match response cache configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// Whether the in-process response cache is enabled.
+    pub enabled: bool,
+    /// Maximum cache size in megabytes (byte-weighted by body length).
+    pub size_mb: u64,
+    /// Time-to-live for cached responses, in seconds.
+    pub ttl_seconds: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            size_mb: 256,
+            ttl_seconds: 3600,
+        }
+    }
+}
+
 impl Config {
     /// Load configuration by layering defaults, an optional YAML file, and
     /// environment variables (prefixed `VAULTPLANE_`, nested keys split on `__`).
@@ -266,6 +290,9 @@ mod tests {
             assert!(cfg.auth.keys.is_empty());
             assert!(cfg.models.is_empty());
             assert!(cfg.pricing.providers.is_empty());
+            assert!(cfg.cache.enabled);
+            assert_eq!(cfg.cache.size_mb, 256);
+            assert_eq!(cfg.cache.ttl_seconds, 3600);
 
             // A YAML file overrides one field; the other keeps its default.
             jail.create_file("vp.yaml", "listen:\n  address: \"127.0.0.1:9000\"\n")?;

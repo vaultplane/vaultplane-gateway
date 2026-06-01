@@ -18,6 +18,7 @@ use axum::http::header::AUTHORIZATION;
 use clap::Parser;
 use tokio::net::TcpListener;
 use vaultplane_core::auth::KeyStore;
+use vaultplane_core::cache::ResponseCache;
 use vaultplane_core::config::Config;
 use vaultplane_core::provider::Connector;
 use vaultplane_core::provider::anthropic::AnthropicConnector;
@@ -177,6 +178,19 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     let pricing = Arc::new(config.pricing.clone());
 
+    let cache = if config.cache.enabled {
+        let size_bytes = config.cache.size_mb.saturating_mul(1024 * 1024);
+        let ttl = std::time::Duration::from_secs(config.cache.ttl_seconds);
+        tracing::info!(
+            size_mb = config.cache.size_mb,
+            ttl_seconds = config.cache.ttl_seconds,
+            "response cache enabled"
+        );
+        Some(Arc::new(ResponseCache::new(size_bytes, ttl)))
+    } else {
+        None
+    };
+
     let state = AppState::new(config, admin_token);
 
     let proxy_listener = TcpListener::bind(proxy_addr)
@@ -192,7 +206,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // Configuration is loaded and both listeners are bound: ready to serve.
     state.set_ready(true);
 
-    let proxy_app = proxy::router(connector, keys, pricing);
+    let proxy_app = proxy::router(connector, keys, pricing, cache);
     let admin_app = admin::router(state);
 
     // Broadcast a single shutdown signal to both servers for a graceful drain.

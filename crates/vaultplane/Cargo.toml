@@ -17,6 +17,7 @@ vaultplane-core.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
+futures.workspace = true
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true

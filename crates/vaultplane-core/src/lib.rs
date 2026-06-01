@@ -7,6 +7,7 @@
 //! layout the data plane will grow into.
 
 pub mod auth;
+pub mod cache;
 pub mod config;
 pub mod error;
 pub mod provider;
