@@ -6,23 +6,35 @@
 //! the response, finish reason, and token usage are mapped back to the OpenAI shape.
 //! The upstream model comes from the route, not the request body.
 //!
+//! Streaming is supported: when the client requests `stream: true`, Anthropic's
+//! native SSE event stream is converted on the fly into OpenAI Chat Completions
+//! chunks (`chat.completion.chunk` events, terminated by `data: [DONE]`). Token
+//! usage on streaming responses is not yet recorded against the span and spend
+//! tracker; that is a follow-up.
+//!
 //! The schema transform (`parse_openai_messages`, `to_openai_response`) is shared
 //! with the Bedrock connector, which speaks the same Anthropic Messages schema.
-//!
-//! Streaming requests are not yet supported (they return 501). Multimodal (array)
-//! message content is not yet supported.
+//! Multimodal (array) message content is not yet supported.
 
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::StreamExt;
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::{Error, Result};
-use crate::provider::{ChatRequest, ChatResponse, Connector, Usage, single_chunk};
+use crate::provider::{BodyStream, ChatRequest, ChatResponse, Connector, Usage, single_chunk};
+use crate::sse::{SseEvent, SseParser};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+const DONE_MARKER: &[u8] = b"data: [DONE]\n\n";
 
 /// Connector for the Anthropic Messages API.
 pub struct AnthropicConnector {
@@ -118,6 +130,8 @@ struct AnthropicRequest {
     system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 // Incoming Anthropic Messages response (the subset we map).
@@ -152,9 +166,9 @@ struct AnthropicUsage {
 }
 
 /// Map an Anthropic stop reason to an OpenAI finish reason.
-fn finish_reason(stop_reason: Option<&str>) -> &'static str {
+fn map_finish_reason(stop_reason: &str) -> &'static str {
     match stop_reason {
-        Some("max_tokens") => "length",
+        "max_tokens" => "length",
         _ => "stop",
     }
 }
@@ -191,7 +205,7 @@ pub(crate) fn to_openai_response(body: &[u8]) -> Result<(Vec<u8>, Usage)> {
         "choices": [{
             "index": 0,
             "message": { "role": "assistant", "content": content },
-            "finish_reason": finish_reason(response.stop_reason.as_deref()),
+            "finish_reason": map_finish_reason(response.stop_reason.as_deref().unwrap_or("")),
         }],
         "usage": {
             "prompt_tokens": usage.prompt_tokens,
@@ -205,6 +219,154 @@ pub(crate) fn to_openai_response(body: &[u8]) -> Result<(Vec<u8>, Usage)> {
     Ok((encoded, usage))
 }
 
+/// Stateful conversion from Anthropic event stream to OpenAI Chat Completions
+/// chunk stream.
+struct AnthropicTransform {
+    chat_id: String,
+    created: u64,
+    model: String,
+}
+
+impl AnthropicTransform {
+    fn new(model: String) -> Self {
+        let mut id_bytes = [0u8; 8];
+        let _ = getrandom::getrandom(&mut id_bytes);
+        let chat_id = format!("chatcmpl-{}", hex::encode(id_bytes));
+        let created = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            chat_id,
+            created,
+            model,
+        }
+    }
+
+    fn process(&mut self, event: &SseEvent) -> Vec<Bytes> {
+        let mut out = Vec::new();
+        let event_type = event.event.as_deref().unwrap_or("");
+        let data: serde_json::Value = match serde_json::from_str(&event.data) {
+            Ok(value) => value,
+            Err(_) => return out,
+        };
+
+        match event_type {
+            "message_start" => {
+                if let Some(model) = data
+                    .get("message")
+                    .and_then(|m| m.get("model"))
+                    .and_then(|m| m.as_str())
+                {
+                    self.model = model.to_string();
+                }
+                out.push(self.chunk(json!({ "role": "assistant" }), None));
+            }
+            "content_block_delta" => {
+                if data
+                    .get("delta")
+                    .and_then(|d| d.get("type"))
+                    .and_then(|t| t.as_str())
+                    == Some("text_delta")
+                    && let Some(text) = data
+                        .get("delta")
+                        .and_then(|d| d.get("text"))
+                        .and_then(|t| t.as_str())
+                {
+                    out.push(self.chunk(json!({ "content": text }), None));
+                }
+            }
+            "message_delta" => {
+                let stop_reason = data
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|v| v.as_str())
+                    .map(map_finish_reason);
+                out.push(self.chunk(json!({}), stop_reason));
+            }
+            // `message_stop`, `content_block_start`, `content_block_stop`, `ping`,
+            // and any unknown events have no OpenAI equivalent and are dropped.
+            // The terminal `data: [DONE]` is emitted by the adapter on stream end.
+            _ => {}
+        }
+        out
+    }
+
+    fn chunk(&self, delta: serde_json::Value, finish_reason: Option<&'static str>) -> Bytes {
+        let chunk = json!({
+            "id": self.chat_id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }]
+        });
+        Bytes::from(format!("data: {chunk}\n\n").into_bytes())
+    }
+}
+
+/// Stream adapter that consumes Anthropic SSE bytes and emits OpenAI Chat
+/// Completions SSE bytes. Terminates the output with `data: [DONE]\n\n`.
+struct AnthropicStreamAdapter {
+    inner: BodyStream,
+    parser: SseParser,
+    transform: AnthropicTransform,
+    pending: VecDeque<Bytes>,
+    upstream_done: bool,
+    emitted_done: bool,
+}
+
+impl AnthropicStreamAdapter {
+    fn new(inner: BodyStream, initial_model: String) -> Self {
+        Self {
+            inner,
+            parser: SseParser::new(),
+            transform: AnthropicTransform::new(initial_model),
+            pending: VecDeque::new(),
+            upstream_done: false,
+            emitted_done: false,
+        }
+    }
+}
+
+impl Stream for AnthropicStreamAdapter {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(out) = this.pending.pop_front() {
+                return Poll::Ready(Some(Ok(out)));
+            }
+            if this.upstream_done {
+                if !this.emitted_done {
+                    this.emitted_done = true;
+                    return Poll::Ready(Some(Ok(Bytes::from_static(DONE_MARKER))));
+                }
+                return Poll::Ready(None);
+            }
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.parser.feed(&chunk);
+                    while let Some(event) = this.parser.next_event() {
+                        for out in this.transform.process(&event) {
+                            this.pending.push_back(out);
+                        }
+                    }
+                }
+                Poll::Ready(None) => {
+                    this.upstream_done = true;
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Connector for AnthropicConnector {
     fn name(&self) -> &str {
@@ -212,28 +374,16 @@ impl Connector for AnthropicConnector {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        if request.stream {
-            let body = json!({
-                "error": { "message": "streaming is not yet supported for the Anthropic provider" }
-            });
-            return Ok(ChatResponse {
-                status: 501,
-                content_type: Some("application/json".to_string()),
-                body: single_chunk(serde_json::to_vec(&body).unwrap_or_default()),
-                provider: "anthropic".to_string(),
-                model: request.model,
-                usage: None,
-                attempts: 1,
-            });
-        }
-
         let parts = parse_openai_messages(&request.body)?;
+        let stream_requested = request.stream;
+        let model_for_response = request.model.clone();
         let payload = serde_json::to_vec(&AnthropicRequest {
-            model: request.model.clone(),
+            model: request.model,
             messages: parts.messages,
             max_tokens: parts.max_tokens,
             system: parts.system,
             temperature: parts.temperature,
+            stream: stream_requested.then_some(true),
         })
         .map_err(|e| Error::Provider(format!("failed to encode request: {e}")))?;
 
@@ -250,12 +400,32 @@ impl Connector for AnthropicConnector {
             .map_err(|e| Error::Provider(format!("request to Anthropic failed: {e}")))?;
 
         let status = response.status().as_u16();
+
+        if stream_requested && status == 200 {
+            let upstream: BodyStream = response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(std::io::Error::other))
+                .boxed();
+            let adapter = AnthropicStreamAdapter::new(upstream, model_for_response.clone());
+            return Ok(ChatResponse {
+                status: 200,
+                content_type: Some("text/event-stream".to_string()),
+                body: adapter.boxed(),
+                provider: "anthropic".to_string(),
+                model: model_for_response,
+                // Streaming usage extraction is a follow-up; it requires observing
+                // the SSE events past the proxy handler return point.
+                usage: None,
+                attempts: 1,
+            });
+        }
+
+        // Non-streaming path (or error response: pass through the JSON body).
         let upstream_body = response
             .bytes()
             .await
             .map_err(|e| Error::Provider(format!("reading Anthropic response failed: {e}")))?;
 
-        // Forward upstream errors as-is; only the success body needs translating.
         let (body, usage) = if status == 200 {
             let (encoded, usage) = to_openai_response(&upstream_body)?;
             (encoded, Some(usage))
@@ -268,7 +438,7 @@ impl Connector for AnthropicConnector {
             content_type: Some("application/json".to_string()),
             body: single_chunk(body),
             provider: "anthropic".to_string(),
-            model: request.model,
+            model: model_for_response,
             usage,
             attempts: 1,
         })
@@ -347,16 +517,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_is_not_yet_supported() {
-        let connector = AnthropicConnector::new("http://127.0.0.1:1", "test-key").unwrap();
+    async fn streams_anthropic_events_as_openai_sse() {
+        let server = MockServer::start().await;
+        let upstream_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-3-7-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":10}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_partial_json(json!({ "stream": true })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(upstream_body),
+            )
+            .mount(&server)
+            .await;
+
+        let connector = AnthropicConnector::new(server.uri(), "test-key").unwrap();
+        let body = serde_json::to_vec(&json!({
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .unwrap();
+
         let response = connector
             .chat(ChatRequest {
                 model: "claude-3-7-sonnet".to_string(),
                 stream: true,
-                body: Bytes::from_static(b"{}"),
+                body: Bytes::from(body),
             })
             .await
             .unwrap();
-        assert_eq!(response.status, 501);
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type.as_deref(), Some("text/event-stream"));
+        let bytes = collect(response.body).await;
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(
+            text.contains("\"role\":\"assistant\""),
+            "missing role chunk: {text}"
+        );
+        assert!(
+            text.contains("\"content\":\"Hello\""),
+            "missing 'Hello' chunk: {text}"
+        );
+        assert!(
+            text.contains("\"content\":\" world\""),
+            "missing ' world' chunk: {text}"
+        );
+        assert!(
+            text.contains("\"finish_reason\":\"stop\""),
+            "missing finish chunk: {text}"
+        );
+        assert!(text.contains("data: [DONE]"), "missing DONE: {text}");
+        assert!(
+            text.contains("chat.completion.chunk"),
+            "missing chunk object: {text}"
+        );
     }
 }
