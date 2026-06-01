@@ -165,9 +165,29 @@ fn key_create(
     if let Some(rps) = rps {
         println!("    rate_limit_rps: {rps}");
     }
-    if let Some(spend) = spend {
-        println!("    # spend_limit: {spend}  (configured but not yet enforced)");
+    if let Some(spec) = spend {
+        let (amount, period) = parse_spend(&spec)?;
+        println!("    spend_limit:");
+        println!("      amount_usd: {amount}");
+        println!("      period: {period}");
     }
 
     Ok(())
+}
+
+/// Parse a spend limit specifier of the form `AMOUNT/PERIOD`, for example `500/day`.
+fn parse_spend(spec: &str) -> anyhow::Result<(f64, &'static str)> {
+    let (amount, period) = spec
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("spend must be AMOUNT/PERIOD, got '{spec}'"))?;
+    let amount: f64 = amount
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid spend amount '{amount}': {e}"))?;
+    let period = match period {
+        "day" => "day",
+        "week" => "week",
+        "month" => "month",
+        other => anyhow::bail!("unknown period '{other}'; expected day, week, or month"),
+    };
+    Ok((amount, period))
 }

@@ -17,7 +17,7 @@ use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use clap::Parser;
 use tokio::net::TcpListener;
-use vaultplane_core::auth::{KeyStore, RateLimiter};
+use vaultplane_core::auth::{KeyStore, RateLimiter, SpendTracker};
 use vaultplane_core::cache::ResponseCache;
 use vaultplane_core::config::Config;
 use vaultplane_core::provider::Connector;
@@ -179,6 +179,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let pricing = Arc::new(config.pricing.clone());
 
     let rate_limiter = Arc::new(RateLimiter::default());
+    let spend_tracker = Arc::new(SpendTracker::default());
 
     let cache = if config.cache.enabled {
         let size_bytes = config.cache.size_mb.saturating_mul(1024 * 1024);
@@ -208,7 +209,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // Configuration is loaded and both listeners are bound: ready to serve.
     state.set_ready(true);
 
-    let proxy_app = proxy::router(connector, keys, pricing, cache, rate_limiter);
+    let proxy_app = proxy::router(connector, keys, pricing, cache, rate_limiter, spend_tracker);
     let admin_app = admin::router(state);
 
     // Broadcast a single shutdown signal to both servers for a graceful drain.

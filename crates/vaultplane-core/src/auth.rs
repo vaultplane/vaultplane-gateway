@@ -1,10 +1,13 @@
-//! Virtual key authentication and rate limiting.
+//! Virtual key authentication, rate limiting, and spend tracking.
 //!
 //! A virtual key is an opaque bearer token (prefixed `vp_`) plus the scope it is
 //! attributed to. The plaintext token is never persisted by the gateway: at-rest
 //! storage holds a SHA-256 hex digest of the token, and incoming tokens are hashed
 //! on every request before the key store is queried. Operators generate keys with
 //! `vaultplane-ctl key create` and copy the resulting record into config.
+//!
+//! Keys carry optional expiration (`expires_at`, RFC3339), a per-second rate limit,
+//! and a per-period USD spend limit. The proxy enforces all three.
 //!
 //! The PRD example shows `argon2id` for the at-rest hash, but argon2id is
 //! intentionally slow (~10ms per verify) and would gate every gateway request on
@@ -19,10 +22,28 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 const TOKEN_PREFIX: &str = "vp_";
 const TOKEN_BYTES: usize = 32;
 const ID_PREFIX_LEN: usize = 12;
+
+/// The period a spend limit resets over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Period {
+    Day,
+    Week,
+    Month,
+}
+
+/// A per-period USD spend limit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SpendLimit {
+    pub amount_usd: f64,
+    pub period: Period,
+}
 
 /// A virtual key record (the form stored in config and the gateway's `KeyStore`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,11 +67,17 @@ pub struct VirtualKey {
     /// Per-key rate limit in requests per second. `None` means no limit.
     #[serde(default)]
     pub rate_limit_rps: Option<u32>,
+    /// Per-period USD spend limit. `None` means no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_limit: Option<SpendLimit>,
+    /// RFC3339 timestamp after which the key is rejected. `None` means no expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 impl VirtualKey {
-    /// An unscoped key used when no keys are configured (allows any model, no rate
-    /// limit).
+    /// An unscoped key used when no keys are configured (allows any model, no
+    /// limits, no expiry).
     pub fn anonymous() -> Self {
         Self {
             id: String::new(),
@@ -60,6 +87,8 @@ impl VirtualKey {
             env: String::new(),
             models: Vec::new(),
             rate_limit_rps: None,
+            spend_limit: None,
+            expires_at: None,
         }
     }
 
@@ -75,6 +104,21 @@ impl VirtualKey {
             "anonymous".to_string()
         } else {
             self.id.clone()
+        }
+    }
+
+    /// Whether the key has expired (per its RFC3339 `expires_at`).
+    ///
+    /// A `None` `expires_at` means no expiry. An unparseable timestamp is treated
+    /// as expired so a typo in config locks the key out rather than silently
+    /// disabling the expiry check.
+    pub fn is_expired(&self) -> bool {
+        match &self.expires_at {
+            None => false,
+            Some(when) => match OffsetDateTime::parse(when, &Rfc3339) {
+                Ok(expiry) => OffsetDateTime::now_utc() > expiry,
+                Err(_) => true,
+            },
         }
     }
 }
@@ -189,8 +233,7 @@ impl TokenBucket {
 
 impl RateLimiter {
     /// Try to consume one request from the bucket for the given key id.
-    ///
-    /// Returns `true` if the request is allowed and `false` if the bucket is empty.
+    /// Returns `true` if the request is allowed.
     pub fn check(&self, key_id: &str, rps: u32) -> bool {
         let mut buckets = self
             .buckets
@@ -200,6 +243,61 @@ impl RateLimiter {
             .entry(key_id.to_string())
             .or_insert_with(|| TokenBucket::new(rps));
         bucket.try_consume()
+    }
+}
+
+/// Per-key cumulative USD spend, bucketed by period.
+#[derive(Default)]
+pub struct SpendTracker {
+    entries: Mutex<HashMap<String, SpendState>>,
+}
+
+struct SpendState {
+    period_token: u64,
+    cumulative_usd: f64,
+}
+
+/// Encode the current period into a single integer for cheap equality comparison.
+fn current_period_token(period: Period) -> u64 {
+    let now = OffsetDateTime::now_utc();
+    match period {
+        Period::Day => (now.unix_timestamp() / 86_400) as u64,
+        Period::Week => (now.year() as u64) * 100 + u64::from(now.iso_week()),
+        Period::Month => (now.year() as u64) * 100 + u64::from(u8::from(now.month())),
+    }
+}
+
+impl SpendTracker {
+    /// Whether the key has remaining budget in the current period.
+    pub fn pre_check(&self, key_id: &str, limit: &SpendLimit) -> bool {
+        let token = current_period_token(limit.period);
+        let entries = self
+            .entries
+            .lock()
+            .expect("spend tracker mutex must not be poisoned");
+        match entries.get(key_id) {
+            Some(state) if state.period_token == token => state.cumulative_usd < limit.amount_usd,
+            _ => true,
+        }
+    }
+
+    /// Record the cost of a completed request against the current period. Resets
+    /// the bucket on a period rollover.
+    pub fn record(&self, key_id: &str, period: Period, cost: f64) {
+        let token = current_period_token(period);
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("spend tracker mutex must not be poisoned");
+        let state = entries.entry(key_id.to_string()).or_insert(SpendState {
+            period_token: token,
+            cumulative_usd: 0.0,
+        });
+        if state.period_token != token {
+            state.period_token = token;
+            state.cumulative_usd = 0.0;
+        }
+        state.cumulative_usd += cost;
     }
 }
 
@@ -248,7 +346,6 @@ mod tests {
         assert!(key.id.starts_with("vp_"));
         assert_eq!(key.id.len(), 3 + ID_PREFIX_LEN);
         assert_eq!(key.hash, hash_token(&key.token));
-        // Two generations produce different tokens (overwhelming probability).
         let other = generate_key();
         assert_ne!(key.token, other.token);
     }
@@ -256,11 +353,51 @@ mod tests {
     #[test]
     fn rate_limiter_enforces_per_key_rps() {
         let limiter = RateLimiter::default();
-        // Bucket starts full at capacity = rps.
         assert!(limiter.check("k1", 2));
         assert!(limiter.check("k1", 2));
         assert!(!limiter.check("k1", 2), "third request should be rejected");
-        // A different key has its own bucket.
         assert!(limiter.check("k2", 2));
+    }
+
+    #[test]
+    fn expiration_is_evaluated_against_now() {
+        let mut key = VirtualKey::anonymous();
+        assert!(!key.is_expired(), "no expires_at means no expiry");
+
+        key.expires_at = Some("1970-01-01T00:00:00Z".to_string());
+        assert!(key.is_expired(), "long past timestamp is expired");
+
+        key.expires_at = Some("2999-12-31T23:59:59Z".to_string());
+        assert!(!key.is_expired(), "distant future is not expired");
+
+        key.expires_at = Some("not a timestamp".to_string());
+        assert!(
+            key.is_expired(),
+            "unparseable timestamps are treated as expired"
+        );
+    }
+
+    #[test]
+    fn spend_tracker_blocks_after_limit_reached() {
+        let tracker = SpendTracker::default();
+        let limit = SpendLimit {
+            amount_usd: 1.0,
+            period: Period::Day,
+        };
+
+        assert!(tracker.pre_check("k1", &limit), "fresh key has budget");
+        tracker.record("k1", Period::Day, 0.6);
+        assert!(
+            tracker.pre_check("k1", &limit),
+            "0.6 < 1.0, still has budget"
+        );
+        tracker.record("k1", Period::Day, 0.5);
+        assert!(
+            !tracker.pre_check("k1", &limit),
+            "1.1 >= 1.0, over the limit"
+        );
+
+        // A different key has its own bucket.
+        assert!(tracker.pre_check("k2", &limit));
     }
 }
