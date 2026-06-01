@@ -30,10 +30,12 @@ vaultplane-plugin-sdk = { path = "crates/vaultplane-plugin-sdk" }
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
+base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["yaml", "env"] }
 futures = "0.3"
+getrandom = "0.2"
 hex = "0.4"
 hmac = "0.12"
 moka = { version = "0.12", features = ["future"] }

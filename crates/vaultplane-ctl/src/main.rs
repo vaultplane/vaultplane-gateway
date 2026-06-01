@@ -1,8 +1,8 @@
 //! `vaultplane-ctl`: operator CLI for VaultPlane Gateway.
 //!
-//! The subcommands mirror the operations an operator performs against a running
-//! gateway or its configuration. The implementations are stubs today; each reports
-//! that it is not yet implemented while the command surface is established.
+//! Today this implements `key create` (generate a virtual key and print a YAML
+//! record to drop into the gateway's `auth.keys` list); the other subcommands are
+//! stubbed while the surface is established.
 
 use clap::{Parser, Subcommand};
 
@@ -57,7 +57,7 @@ enum ConfigAction {
 
 #[derive(Debug, Subcommand)]
 enum KeyAction {
-    /// Create a virtual key.
+    /// Create a virtual key and print a YAML record for the gateway config.
     Create {
         /// Team the key is attributed to.
         #[arg(long)]
@@ -74,7 +74,7 @@ enum KeyAction {
         /// Requests-per-second rate limit.
         #[arg(long)]
         rps: Option<u32>,
-        /// Spend limit, given as AMOUNT/PERIOD, for example 500/day.
+        /// Spend limit (not yet enforced), given as AMOUNT/PERIOD, for example 500/day.
         #[arg(long)]
         spend: Option<String>,
     },
@@ -93,9 +93,8 @@ enum ModelAction {
     List,
 }
 
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let action = match cli.command {
+fn action_name(command: &Command) -> &'static str {
+    match command {
         Command::Config { action } => match action {
             ConfigAction::Validate { .. } => "config validate",
             ConfigAction::Diff { .. } => "config diff",
@@ -109,6 +108,66 @@ fn main() -> anyhow::Result<()> {
             ModelAction::List => "model list",
         },
         Command::Status { .. } => "status",
-    };
-    anyhow::bail!("`vaultplane-ctl {action}` is not yet implemented")
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let name = action_name(&cli.command);
+    match cli.command {
+        Command::Key {
+            action:
+                KeyAction::Create {
+                    team,
+                    app,
+                    env,
+                    models,
+                    rps,
+                    spend,
+                },
+        } => key_create(team, app, env, models, rps, spend),
+        _ => anyhow::bail!("`vaultplane-ctl {name}` is not yet implemented"),
+    }
+}
+
+fn key_create(
+    team: String,
+    app: String,
+    env: String,
+    models: Vec<String>,
+    rps: Option<u32>,
+    spend: Option<String>,
+) -> anyhow::Result<()> {
+    let key = vaultplane_core::auth::generate_key();
+
+    println!("Token: {}", key.token);
+    println!("Key id: {}", key.id);
+    println!();
+    println!("Save the token now; it cannot be recovered (the gateway only stores the hash).");
+    println!();
+    println!("Add this entry to the gateway's auth.keys list:");
+    println!();
+    println!("  - id: \"{}\"", key.id);
+    println!("    hash: \"{}\"", key.hash);
+    println!("    team: \"{team}\"");
+    println!("    app: \"{app}\"");
+    println!("    env: \"{env}\"");
+    if models.is_empty() {
+        println!("    models: []");
+    } else {
+        let list = models
+            .iter()
+            .map(|m| format!("\"{m}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("    models: [{list}]");
+    }
+    if let Some(rps) = rps {
+        println!("    rate_limit_rps: {rps}");
+    }
+    if let Some(spend) = spend {
+        println!("    # spend_limit: {spend}  (configured but not yet enforced)");
+    }
+
+    Ok(())
 }

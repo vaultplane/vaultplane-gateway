@@ -13,5 +13,6 @@ name = "vaultplane-ctl"
 path = "src/main.rs"
 
 [dependencies]
+vaultplane-core.workspace = true
 anyhow.workspace = true
 clap.workspace = true

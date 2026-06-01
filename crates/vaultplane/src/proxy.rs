@@ -1,11 +1,11 @@
 //! OpenAI-compatible proxy API.
 //!
-//! Each request is authenticated, optionally served from the exact-match cache,
-//! and otherwise dispatched through the provider connector (typically the model
-//! registry). Successful non-streaming responses are stored in the cache before
-//! being returned. Each request is recorded as a tracing span with OpenTelemetry
-//! GenAI semantic-convention attributes plus VaultPlane attributes (virtual key id,
-//! team, app, env, attempts, cost, status, duration, cache hit).
+//! Each request is authenticated, rate-limited per key, optionally served from the
+//! exact-match cache, and otherwise dispatched through the provider connector
+//! (typically the model registry). Successful non-streaming responses are stored in
+//! the cache before being returned. Each request is recorded as a tracing span with
+//! OpenTelemetry GenAI semantic-convention attributes plus VaultPlane attributes
+//! (virtual key id, team, app, env, attempts, cost, status, duration, cache hit).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -22,7 +22,7 @@ use axum::{
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
-use vaultplane_core::auth::{KeyStore, VirtualKey};
+use vaultplane_core::auth::{KeyStore, RateLimiter, VirtualKey};
 use vaultplane_core::cache::{CachedResponse, ResponseCache};
 use vaultplane_core::config::Pricing;
 use vaultplane_core::provider::{BodyStream, ChatRequest, Connector, Usage};
@@ -36,21 +36,24 @@ struct ProxyState {
     keys: Arc<KeyStore>,
     pricing: Arc<Pricing>,
     cache: Option<Arc<ResponseCache>>,
+    rate_limiter: Arc<RateLimiter>,
 }
 
-/// Build the proxy API router around a provider connector, key store, pricing, and
-/// optional response cache.
+/// Build the proxy API router around a provider connector, key store, pricing,
+/// optional response cache, and a rate limiter.
 pub fn router(
     connector: Arc<dyn Connector>,
     keys: Arc<KeyStore>,
     pricing: Arc<Pricing>,
     cache: Option<Arc<ResponseCache>>,
+    rate_limiter: Arc<RateLimiter>,
 ) -> Router {
     let state = ProxyState {
         connector,
         keys,
         pricing,
         cache,
+        rate_limiter,
     };
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -61,10 +64,9 @@ pub fn router(
         .with_state(state)
 }
 
-/// Authenticate a request against the virtual key store and attach the resolved key.
-///
-/// When no keys are configured the proxy is open and an anonymous key (which allows
-/// any model) is attached so downstream handlers have a uniform key to read.
+/// Authenticate the request against the virtual key store, then enforce the key's
+/// rate limit (when configured). Anonymous traffic (no keys configured) is allowed
+/// through unrestricted.
 async fn authenticate(
     State(state): State<ProxyState>,
     mut request: Request,
@@ -80,6 +82,13 @@ async fn authenticate(
             None => return error(StatusCode::UNAUTHORIZED, "missing or invalid virtual key"),
         }
     };
+
+    if let Some(rps) = key.rate_limit_rps
+        && !state.rate_limiter.check(&key.identifier(), rps)
+    {
+        return error(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded");
+    }
+
     request.extensions_mut().insert(key);
     next.run(request).await
 }
@@ -125,7 +134,7 @@ async fn chat_completions(
         "gen_ai.response.model" = tracing::field::Empty,
         "gen_ai.usage.input_tokens" = tracing::field::Empty,
         "gen_ai.usage.output_tokens" = tracing::field::Empty,
-        "vaultplane.virtual_key.id" = %key.id(),
+        "vaultplane.virtual_key.id" = %key.identifier(),
         "vaultplane.team" = %key.team,
         "vaultplane.app" = %key.app,
         "vaultplane.env" = %key.env,
@@ -147,13 +156,14 @@ async fn chat_completions(
     }
 
     // Compute the cache key for cacheable (non-streaming) requests.
-    let cache_key = (!meta.stream).then(|| ResponseCache::key(&key.id(), &virtual_model, &body));
+    let cache_key =
+        (!meta.stream).then(|| ResponseCache::key(&key.identifier(), &virtual_model, &body));
 
     // Cache lookup.
-    if let (Some(cache), Some(key_str)) = (state.cache.as_ref(), cache_key.as_ref()) {
-        if let Some(cached) = cache.get(key_str).await {
-            return serve_from_cache(&state.pricing, &span, &cached, start);
-        }
+    if let (Some(cache), Some(key_str)) = (state.cache.as_ref(), cache_key.as_ref())
+        && let Some(cached) = cache.get(key_str).await
+    {
+        return serve_from_cache(&state.pricing, &span, &cached, start);
     }
 
     let request = ChatRequest {
@@ -295,7 +305,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tower::ServiceExt;
-    use vaultplane_core::auth::{KeyStore, VirtualKey};
+    use vaultplane_core::auth::{KeyStore, RateLimiter, VirtualKey, hash_token};
     use vaultplane_core::cache::ResponseCache;
     use vaultplane_core::config::{ModelPricing, Pricing};
     use vaultplane_core::provider::Connector;
@@ -320,9 +330,15 @@ mod tests {
         None
     }
 
+    fn no_rate_limit() -> Arc<RateLimiter> {
+        Arc::new(RateLimiter::default())
+    }
+
     fn store_with_key(models: &[&str]) -> Arc<KeyStore> {
+        let token = "vp_test";
         let mut key = VirtualKey::anonymous();
-        key.token = "vp_test".to_string();
+        key.id = "vp_test_id".to_string();
+        key.hash = hash_token(token);
         key.models = models.iter().map(|m| m.to_string()).collect();
         Arc::new(KeyStore::new(vec![key]))
     }
@@ -383,6 +399,7 @@ mod tests {
             open_keys(),
             open_pricing(),
             no_cache(),
+            no_rate_limit(),
         );
         let response = app.oneshot(chat_request(None, "gpt-4o")).await.unwrap();
 
@@ -400,6 +417,7 @@ mod tests {
             store_with_key(&["gpt-4o"]),
             open_pricing(),
             no_cache(),
+            no_rate_limit(),
         );
         let response = app.oneshot(chat_request(None, "gpt-4o")).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -412,6 +430,7 @@ mod tests {
             store_with_key(&["gpt-4o"]),
             open_pricing(),
             no_cache(),
+            no_rate_limit(),
         );
         let response = app
             .oneshot(chat_request(Some("vp_test"), "gpt-3.5"))
@@ -434,6 +453,7 @@ mod tests {
             store_with_key(&["gpt-4o"]),
             open_pricing(),
             no_cache(),
+            no_rate_limit(),
         );
         let response = app
             .oneshot(chat_request(Some("vp_test"), "gpt-4o"))
@@ -449,6 +469,7 @@ mod tests {
             open_keys(),
             open_pricing(),
             no_cache(),
+            no_rate_limit(),
         );
         let response = app
             .oneshot(
@@ -470,6 +491,7 @@ mod tests {
             open_keys(),
             open_pricing(),
             no_cache(),
+            no_rate_limit(),
         );
         let response = app
             .oneshot(
@@ -504,9 +526,9 @@ mod tests {
             open_keys(),
             open_pricing(),
             Some(cache),
+            no_rate_limit(),
         );
 
-        // First request hits upstream and populates the cache.
         let first = app
             .clone()
             .oneshot(chat_request(None, "gpt-4o"))
@@ -515,7 +537,6 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(first.headers().get(super::CACHE_HEADER).unwrap(), "MISS");
 
-        // Second identical request is served from cache: upstream is not called again.
         let second = app.oneshot(chat_request(None, "gpt-4o")).await.unwrap();
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(second.headers().get(super::CACHE_HEADER).unwrap(), "HIT");
@@ -526,5 +547,43 @@ mod tests {
             1,
             "second request must be served from cache"
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_returns_429_when_exceeded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let token = "vp_test";
+        let mut key = VirtualKey::anonymous();
+        key.id = "vp_test_id".to_string();
+        key.hash = hash_token(token);
+        key.rate_limit_rps = Some(1);
+        let keys = Arc::new(KeyStore::new(vec![key]));
+
+        let app = router(
+            connector(&server.uri()),
+            keys,
+            open_pricing(),
+            no_cache(),
+            no_rate_limit(),
+        );
+
+        let first = app
+            .clone()
+            .oneshot(chat_request(Some(token), "gpt-4o"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app
+            .oneshot(chat_request(Some(token), "gpt-4o"))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

@@ -10,9 +10,11 @@ authors.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
 bytes.workspace = true
 figment.workspace = true
 futures.workspace = true
+getrandom.workspace = true
 hex.workspace = true
 hmac.workspace = true
 moka.workspace = true
