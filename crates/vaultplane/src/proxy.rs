@@ -112,7 +112,7 @@ async fn authenticate(
         VirtualKey::anonymous()
     } else {
         match crate::bearer_token(request.headers())
-            .and_then(|token| state.keys.authenticate(token).cloned())
+            .and_then(|token| state.keys.authenticate(token))
         {
             Some(key) => key,
             None => return error(StatusCode::UNAUTHORIZED, "missing or invalid virtual key"),

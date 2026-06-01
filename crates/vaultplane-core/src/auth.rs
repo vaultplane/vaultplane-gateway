@@ -15,7 +15,7 @@
 //! is the correct choice and matches industry practice for API key storage.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
 use base64::Engine;
@@ -153,31 +153,77 @@ pub fn hash_token(token: &str) -> String {
 }
 
 /// An in-memory lookup of virtual keys keyed by token hash.
-#[derive(Debug, Clone, Default)]
+///
+/// The store is interior-mutable so the admin API can issue and revoke keys at
+/// runtime without taking the gateway down. Reads (authentication) take a
+/// shared lock; writes (insert and remove) take an exclusive lock.
+#[derive(Debug, Default)]
 pub struct KeyStore {
-    by_hash: HashMap<String, VirtualKey>,
+    by_hash: RwLock<HashMap<String, VirtualKey>>,
 }
 
 impl KeyStore {
     /// Build a store from a list of key records.
     pub fn new(keys: Vec<VirtualKey>) -> Self {
-        let by_hash = keys.into_iter().map(|k| (k.hash.clone(), k)).collect();
-        Self { by_hash }
+        let by_hash: HashMap<String, VirtualKey> =
+            keys.into_iter().map(|k| (k.hash.clone(), k)).collect();
+        Self {
+            by_hash: RwLock::new(by_hash),
+        }
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, VirtualKey>> {
+        self.by_hash
+            .read()
+            .expect("key store rwlock must not be poisoned")
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, VirtualKey>> {
+        self.by_hash
+            .write()
+            .expect("key store rwlock must not be poisoned")
     }
 
     /// Hash the incoming token and look up the matching key.
-    pub fn authenticate(&self, token: &str) -> Option<&VirtualKey> {
-        self.by_hash.get(&hash_token(token))
+    pub fn authenticate(&self, token: &str) -> Option<VirtualKey> {
+        self.read().get(&hash_token(token)).cloned()
+    }
+
+    /// Add a freshly issued key to the store. Silently overwrites on the
+    /// astronomically unlikely event of a hash collision.
+    pub fn insert(&self, key: VirtualKey) {
+        self.write().insert(key.hash.clone(), key);
+    }
+
+    /// Remove a key by its non-secret identifier. Returns `true` if a key was
+    /// removed.
+    pub fn remove_by_id(&self, id: &str) -> bool {
+        let mut guard = self.write();
+        let hash = guard
+            .iter()
+            .find_map(|(h, k)| (k.id == id).then(|| h.clone()));
+        match hash {
+            Some(h) => {
+                guard.remove(&h);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Snapshot of every key currently in the store, in unspecified order.
+    pub fn list(&self) -> Vec<VirtualKey> {
+        self.read().values().cloned().collect()
     }
 
     /// Number of configured keys.
     pub fn len(&self) -> usize {
-        self.by_hash.len()
+        self.read().len()
     }
 
     /// Whether no keys are configured (proxy authentication is then disabled).
     pub fn is_empty(&self) -> bool {
-        self.by_hash.is_empty()
+        self.read().is_empty()
     }
 }
 
@@ -244,6 +290,14 @@ impl RateLimiter {
             .or_insert_with(|| TokenBucket::new(rps));
         bucket.try_consume()
     }
+
+    /// Drop the bucket for a key (used when the admin revokes the key).
+    pub fn forget(&self, key_id: &str) {
+        self.buckets
+            .lock()
+            .expect("rate limiter mutex must not be poisoned")
+            .remove(key_id);
+    }
 }
 
 /// Per-key cumulative USD spend, bucketed by period.
@@ -299,6 +353,14 @@ impl SpendTracker {
         }
         state.cumulative_usd += cost;
     }
+
+    /// Drop the spend state for a key (used when the admin revokes the key).
+    pub fn forget(&self, key_id: &str) {
+        self.entries
+            .lock()
+            .expect("spend tracker mutex must not be poisoned")
+            .remove(key_id);
+    }
 }
 
 #[cfg(test)]
@@ -330,6 +392,66 @@ mod tests {
         assert!(store.authenticate(token).is_some());
         assert!(store.authenticate("vp_nope").is_none());
         assert!(KeyStore::default().is_empty());
+    }
+
+    #[test]
+    fn key_store_insert_and_remove_are_visible_to_authenticate() {
+        let store = KeyStore::default();
+        let generated = generate_key();
+
+        let mut key = VirtualKey::anonymous();
+        key.id = generated.id.clone();
+        key.hash = generated.hash.clone();
+        store.insert(key);
+
+        assert_eq!(store.len(), 1);
+        assert!(
+            store.authenticate(&generated.token).is_some(),
+            "freshly issued key authenticates"
+        );
+
+        let listed = store.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, generated.id);
+
+        assert!(store.remove_by_id(&generated.id), "removal reports success");
+        assert!(
+            store.authenticate(&generated.token).is_none(),
+            "revoked key no longer authenticates"
+        );
+        assert!(
+            !store.remove_by_id(&generated.id),
+            "second removal is a no-op"
+        );
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn rate_limiter_forget_clears_the_bucket() {
+        let limiter = RateLimiter::default();
+        assert!(limiter.check("k1", 1));
+        assert!(!limiter.check("k1", 1), "bucket is empty");
+        limiter.forget("k1");
+        assert!(limiter.check("k1", 1), "forget restores a fresh bucket");
+    }
+
+    #[test]
+    fn spend_tracker_forget_clears_state() {
+        let tracker = SpendTracker::default();
+        let limit = SpendLimit {
+            amount_usd: 1.0,
+            period: Period::Day,
+        };
+        tracker.record("k1", Period::Day, 2.0);
+        assert!(
+            !tracker.pre_check("k1", &limit),
+            "over the limit before forget"
+        );
+        tracker.forget("k1");
+        assert!(
+            tracker.pre_check("k1", &limit),
+            "forget resets the period total"
+        );
     }
 
     #[test]

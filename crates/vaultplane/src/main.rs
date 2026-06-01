@@ -223,7 +223,13 @@ async fn run(config: Config) -> anyhow::Result<()> {
         tracing::info!(count = config.plugins.len(), "loaded inline plugins");
     }
 
-    let state = AppState::new(config, admin_token);
+    let state = AppState::new(
+        config,
+        admin_token,
+        keys.clone(),
+        rate_limiter.clone(),
+        spend_tracker.clone(),
+    );
 
     let proxy_listener = TcpListener::bind(proxy_addr)
         .await
