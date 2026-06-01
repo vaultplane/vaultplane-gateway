@@ -194,6 +194,17 @@ async fn run(config: Config) -> anyhow::Result<()> {
         None
     };
 
+    let models = Arc::new(
+        config
+            .models
+            .iter()
+            .map(|m| proxy::RegisteredModel {
+                id: m.name.clone(),
+                provider: m.primary.provider.clone(),
+            })
+            .collect::<Vec<_>>(),
+    );
+
     let state = AppState::new(config, admin_token);
 
     let proxy_listener = TcpListener::bind(proxy_addr)
@@ -209,7 +220,15 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // Configuration is loaded and both listeners are bound: ready to serve.
     state.set_ready(true);
 
-    let proxy_app = proxy::router(connector, keys, pricing, cache, rate_limiter, spend_tracker);
+    let proxy_app = proxy::router(
+        connector,
+        keys,
+        pricing,
+        cache,
+        rate_limiter,
+        spend_tracker,
+        models,
+    );
     let admin_app = admin::router(state);
 
     // Broadcast a single shutdown signal to both servers for a graceful drain.

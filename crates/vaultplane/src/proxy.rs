@@ -31,6 +31,13 @@ use vaultplane_core::stream_observer::UsageObservingStream;
 
 const CACHE_HEADER: &str = "x-vaultplane-cache";
 
+/// A virtual model entry surfaced from the registry by `GET /v1/models`.
+#[derive(Clone, Debug)]
+pub struct RegisteredModel {
+    pub id: String,
+    pub provider: String,
+}
+
 /// Shared state for the proxy API.
 #[derive(Clone)]
 struct ProxyState {
@@ -40,10 +47,13 @@ struct ProxyState {
     cache: Option<Arc<ResponseCache>>,
     rate_limiter: Arc<RateLimiter>,
     spend_tracker: Arc<SpendTracker>,
+    models: Arc<Vec<RegisteredModel>>,
 }
 
 /// Build the proxy API router around a provider connector, key store, pricing,
-/// optional response cache, rate limiter, and spend tracker.
+/// optional response cache, rate limiter, spend tracker, and the registered
+/// virtual model list for `GET /v1/models`.
+#[allow(clippy::too_many_arguments)]
 pub fn router(
     connector: Arc<dyn Connector>,
     keys: Arc<KeyStore>,
@@ -51,6 +61,7 @@ pub fn router(
     cache: Option<Arc<ResponseCache>>,
     rate_limiter: Arc<RateLimiter>,
     spend_tracker: Arc<SpendTracker>,
+    models: Arc<Vec<RegisteredModel>>,
 ) -> Router {
     let state = ProxyState {
         connector,
@@ -59,14 +70,30 @@ pub fn router(
         cache,
         rate_limiter,
         spend_tracker,
+        models,
     };
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(not_implemented))
-        .route("/v1/models", get(not_implemented))
+        .route("/v1/models", get(list_models))
         .fallback(fallback)
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
+}
+
+async fn list_models(State(state): State<ProxyState>) -> Response {
+    let data: Vec<serde_json::Value> = state
+        .models
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "object": "model",
+                "owned_by": m.provider,
+            })
+        })
+        .collect();
+    Json(json!({ "object": "list", "data": data })).into_response()
 }
 
 /// Authenticate the request against the virtual key store, reject expired keys,
@@ -386,6 +413,10 @@ mod tests {
         Arc::new(SpendTracker::default())
     }
 
+    fn no_models() -> Arc<Vec<super::RegisteredModel>> {
+        Arc::new(Vec::new())
+    }
+
     fn store_with_key(models: &[&str]) -> Arc<KeyStore> {
         let token = "vp_test";
         let mut key = VirtualKey::anonymous();
@@ -453,6 +484,7 @@ mod tests {
             no_cache(),
             no_rate_limit(),
             no_spend_tracker(),
+            no_models(),
         );
         let response = app.oneshot(chat_request(None, "gpt-4o")).await.unwrap();
 
@@ -472,6 +504,7 @@ mod tests {
             no_cache(),
             no_rate_limit(),
             no_spend_tracker(),
+            no_models(),
         );
         let response = app.oneshot(chat_request(None, "gpt-4o")).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -486,6 +519,7 @@ mod tests {
             no_cache(),
             no_rate_limit(),
             no_spend_tracker(),
+            no_models(),
         );
         let response = app
             .oneshot(chat_request(Some("vp_test"), "gpt-3.5"))
@@ -510,6 +544,7 @@ mod tests {
             no_cache(),
             no_rate_limit(),
             no_spend_tracker(),
+            no_models(),
         );
         let response = app
             .oneshot(chat_request(Some("vp_test"), "gpt-4o"))
@@ -527,6 +562,7 @@ mod tests {
             no_cache(),
             no_rate_limit(),
             no_spend_tracker(),
+            no_models(),
         );
         let response = app
             .oneshot(
@@ -550,6 +586,7 @@ mod tests {
             no_cache(),
             no_rate_limit(),
             no_spend_tracker(),
+            no_models(),
         );
         let response = app
             .oneshot(
@@ -586,6 +623,7 @@ mod tests {
             Some(cache),
             no_rate_limit(),
             no_spend_tracker(),
+            no_models(),
         );
 
         let first = app
@@ -631,6 +669,7 @@ mod tests {
             no_cache(),
             no_rate_limit(),
             no_spend_tracker(),
+            no_models(),
         );
 
         let first = app
@@ -663,6 +702,7 @@ mod tests {
             no_cache(),
             no_rate_limit(),
             no_spend_tracker(),
+            no_models(),
         );
 
         let response = app
@@ -720,6 +760,7 @@ mod tests {
             no_cache(),
             no_rate_limit(),
             spend_tracker,
+            no_models(),
         );
 
         // Streaming request: drain the body so the SSE flows through the observer
@@ -791,6 +832,7 @@ mod tests {
             no_cache(),
             no_rate_limit(),
             Arc::new(SpendTracker::default()),
+            no_models(),
         );
 
         let first = app
@@ -805,5 +847,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_the_configured_registry() {
+        let models = Arc::new(vec![
+            super::RegisteredModel {
+                id: "smart".to_string(),
+                provider: "openai".to_string(),
+            },
+            super::RegisteredModel {
+                id: "claude-default".to_string(),
+                provider: "anthropic".to_string(),
+            },
+        ]);
+        let app = router(
+            connector("http://127.0.0.1:1"),
+            open_keys(),
+            open_pricing(),
+            no_cache(),
+            no_rate_limit(),
+            no_spend_tracker(),
+            models,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["object"], "list");
+        let data = value["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["id"], "smart");
+        assert_eq!(data[0]["object"], "model");
+        assert_eq!(data[0]["owned_by"], "openai");
+        assert_eq!(data[1]["id"], "claude-default");
+        assert_eq!(data[1]["owned_by"], "anthropic");
+    }
+
+    #[tokio::test]
+    async fn list_models_is_empty_when_no_registry_is_configured() {
+        let app = router(
+            connector("http://127.0.0.1:1"),
+            open_keys(),
+            open_pricing(),
+            no_cache(),
+            no_rate_limit(),
+            no_spend_tracker(),
+            no_models(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["data"].as_array().unwrap().len(), 0);
     }
 }
