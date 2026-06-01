@@ -2490,6 +2490,7 @@ dependencies = [
  "hex",
  "hmac",
  "moka",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

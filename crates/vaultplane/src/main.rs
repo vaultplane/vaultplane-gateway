@@ -19,7 +19,8 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use vaultplane_core::auth::{KeyStore, RateLimiter, SpendTracker};
 use vaultplane_core::cache::ResponseCache;
-use vaultplane_core::config::Config;
+use vaultplane_core::config::{Config, PluginConfig};
+use vaultplane_core::plugin::{PiiRedactionPlugin, Plugin, PluginChain};
 use vaultplane_core::provider::Connector;
 use vaultplane_core::provider::anthropic::AnthropicConnector;
 use vaultplane_core::provider::azure::AzureConnector;
@@ -205,6 +206,23 @@ async fn run(config: Config) -> anyhow::Result<()> {
             .collect::<Vec<_>>(),
     );
 
+    let plugins: PluginChain = Arc::new(
+        config
+            .plugins
+            .iter()
+            .map(|p| -> Box<dyn Plugin> {
+                match p {
+                    PluginConfig::PiiRedaction(c) => {
+                        Box::new(PiiRedactionPlugin::new(&c.patterns, c.replacement.clone()))
+                    }
+                }
+            })
+            .collect(),
+    );
+    if !config.plugins.is_empty() {
+        tracing::info!(count = config.plugins.len(), "loaded inline plugins");
+    }
+
     let state = AppState::new(config, admin_token);
 
     let proxy_listener = TcpListener::bind(proxy_addr)
@@ -228,6 +246,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         rate_limiter,
         spend_tracker,
         models,
+        plugins,
     );
     let admin_app = admin::router(state);
 

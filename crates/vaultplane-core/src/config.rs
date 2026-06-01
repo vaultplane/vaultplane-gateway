@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::VirtualKey;
 use crate::error::{Error, Result};
+use crate::plugin::PiiPattern;
 
 /// Top-level gateway configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -33,6 +34,8 @@ pub struct Config {
     pub pricing: Pricing,
     /// Exact-match response cache configuration.
     pub cache: CacheConfig,
+    /// Inline request-inspection plugins, applied in order.
+    pub plugins: Vec<PluginConfig>,
 }
 
 /// Listener addresses.
@@ -247,6 +250,41 @@ impl Default for CacheConfig {
     }
 }
 
+/// Configuration for a single inline plugin. Today the gateway ships one
+/// built-in plugin (`pii_redaction`); third-party WebAssembly plugins land with
+/// the wasmtime host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PluginConfig {
+    PiiRedaction(PiiRedactionConfig),
+}
+
+/// Knobs for the PII redaction plugin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PiiRedactionConfig {
+    #[serde(default = "default_pii_patterns")]
+    pub patterns: Vec<PiiPattern>,
+    #[serde(default = "default_redaction_replacement")]
+    pub replacement: String,
+}
+
+impl Default for PiiRedactionConfig {
+    fn default() -> Self {
+        Self {
+            patterns: default_pii_patterns(),
+            replacement: default_redaction_replacement(),
+        }
+    }
+}
+
+fn default_pii_patterns() -> Vec<PiiPattern> {
+    PiiPattern::ALL.to_vec()
+}
+
+fn default_redaction_replacement() -> String {
+    "[REDACTED]".to_string()
+}
+
 impl Config {
     /// Load configuration by layering defaults, an optional YAML file, and
     /// environment variables (prefixed `VAULTPLANE_`, nested keys split on `__`).
@@ -293,6 +331,7 @@ mod tests {
             assert!(cfg.cache.enabled);
             assert_eq!(cfg.cache.size_mb, 256);
             assert_eq!(cfg.cache.ttl_seconds, 3600);
+            assert!(cfg.plugins.is_empty());
 
             // A YAML file overrides one field; the other keeps its default.
             jail.create_file("vp.yaml", "listen:\n  address: \"127.0.0.1:9000\"\n")?;

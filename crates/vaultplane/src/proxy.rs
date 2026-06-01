@@ -26,6 +26,7 @@ use serde_json::json;
 use vaultplane_core::auth::{KeyStore, RateLimiter, SpendTracker, VirtualKey};
 use vaultplane_core::cache::{CachedResponse, ResponseCache};
 use vaultplane_core::config::Pricing;
+use vaultplane_core::plugin::{Decision, Plugin, PluginChain, PluginRequest, RejectInfo};
 use vaultplane_core::provider::{BodyStream, ChatRequest, Connector, Usage};
 use vaultplane_core::stream_observer::UsageObservingStream;
 
@@ -48,6 +49,7 @@ struct ProxyState {
     rate_limiter: Arc<RateLimiter>,
     spend_tracker: Arc<SpendTracker>,
     models: Arc<Vec<RegisteredModel>>,
+    plugins: PluginChain,
 }
 
 /// Build the proxy API router around a provider connector, key store, pricing,
@@ -62,6 +64,7 @@ pub fn router(
     rate_limiter: Arc<RateLimiter>,
     spend_tracker: Arc<SpendTracker>,
     models: Arc<Vec<RegisteredModel>>,
+    plugins: PluginChain,
 ) -> Router {
     let state = ProxyState {
         connector,
@@ -71,6 +74,7 @@ pub fn router(
         rate_limiter,
         spend_tracker,
         models,
+        plugins,
     };
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -154,6 +158,26 @@ async fn collect_body(mut body: BodyStream) -> std::io::Result<Bytes> {
     Ok(Bytes::from(buf))
 }
 
+/// Run the inline plugin chain on the request body. Each plugin sees the body
+/// produced by the previous one; on Reject the chain shortcircuits.
+fn run_plugins(plugins: &[Box<dyn Plugin>], body: Bytes) -> Result<Bytes, RejectInfo> {
+    let mut current = body;
+    for plugin in plugins {
+        let request = PluginRequest {
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            headers: Vec::new(),
+            body: current.clone(),
+        };
+        match plugin.inspect_request(&request) {
+            Decision::Pass => {}
+            Decision::Modify(updated) => current = updated.body,
+            Decision::Reject(info) => return Err(info),
+        }
+    }
+    Ok(current)
+}
+
 async fn chat_completions(
     State(state): State<ProxyState>,
     Extension(key): Extension<VirtualKey>,
@@ -204,6 +228,27 @@ async fn chat_completions(
             "spend limit exceeded for this period",
         );
     }
+
+    // Run inline plugins (e.g. PII redaction) before the cache and the upstream
+    // dispatch. A Modify decision replaces the body for the rest of the request;
+    // a Reject decision shortcircuits with the plugin's status and reason.
+    let body = match run_plugins(&state.plugins, body) {
+        Ok(body) => body,
+        Err(info) => {
+            tracing::warn!(
+                reason = %info.reason,
+                status = info.status_code,
+                "request rejected by inline plugin",
+            );
+            span.record("vaultplane.cache.hit", false);
+            span.record("http.response.status_code", u64::from(info.status_code));
+            span.record("duration_ms", start.elapsed().as_millis() as u64);
+            return error(
+                StatusCode::from_u16(info.status_code).unwrap_or(StatusCode::FORBIDDEN),
+                &info.reason,
+            );
+        }
+    };
 
     // Compute the cache key for cacheable (non-streaming) requests.
     let cache_key =
@@ -383,10 +428,11 @@ mod tests {
     };
     use vaultplane_core::cache::ResponseCache;
     use vaultplane_core::config::{ModelPricing, Pricing};
+    use vaultplane_core::plugin::{PiiRedactionPlugin, Plugin, PluginChain};
     use vaultplane_core::provider::Connector;
     use vaultplane_core::provider::Usage;
     use vaultplane_core::provider::openai::OpenAiConnector;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn connector(base_url: &str) -> Arc<dyn Connector> {
@@ -414,6 +460,10 @@ mod tests {
     }
 
     fn no_models() -> Arc<Vec<super::RegisteredModel>> {
+        Arc::new(Vec::new())
+    }
+
+    fn no_plugins() -> PluginChain {
         Arc::new(Vec::new())
     }
 
@@ -485,6 +535,7 @@ mod tests {
             no_rate_limit(),
             no_spend_tracker(),
             no_models(),
+            no_plugins(),
         );
         let response = app.oneshot(chat_request(None, "gpt-4o")).await.unwrap();
 
@@ -505,6 +556,7 @@ mod tests {
             no_rate_limit(),
             no_spend_tracker(),
             no_models(),
+            no_plugins(),
         );
         let response = app.oneshot(chat_request(None, "gpt-4o")).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -520,6 +572,7 @@ mod tests {
             no_rate_limit(),
             no_spend_tracker(),
             no_models(),
+            no_plugins(),
         );
         let response = app
             .oneshot(chat_request(Some("vp_test"), "gpt-3.5"))
@@ -545,6 +598,7 @@ mod tests {
             no_rate_limit(),
             no_spend_tracker(),
             no_models(),
+            no_plugins(),
         );
         let response = app
             .oneshot(chat_request(Some("vp_test"), "gpt-4o"))
@@ -563,6 +617,7 @@ mod tests {
             no_rate_limit(),
             no_spend_tracker(),
             no_models(),
+            no_plugins(),
         );
         let response = app
             .oneshot(
@@ -587,6 +642,7 @@ mod tests {
             no_rate_limit(),
             no_spend_tracker(),
             no_models(),
+            no_plugins(),
         );
         let response = app
             .oneshot(
@@ -624,6 +680,7 @@ mod tests {
             no_rate_limit(),
             no_spend_tracker(),
             no_models(),
+            no_plugins(),
         );
 
         let first = app
@@ -670,6 +727,7 @@ mod tests {
             no_rate_limit(),
             no_spend_tracker(),
             no_models(),
+            no_plugins(),
         );
 
         let first = app
@@ -703,6 +761,7 @@ mod tests {
             no_rate_limit(),
             no_spend_tracker(),
             no_models(),
+            no_plugins(),
         );
 
         let response = app
@@ -761,6 +820,7 @@ mod tests {
             no_rate_limit(),
             spend_tracker,
             no_models(),
+            no_plugins(),
         );
 
         // Streaming request: drain the body so the SSE flows through the observer
@@ -833,6 +893,7 @@ mod tests {
             no_rate_limit(),
             Arc::new(SpendTracker::default()),
             no_models(),
+            no_plugins(),
         );
 
         let first = app
@@ -869,6 +930,7 @@ mod tests {
             no_rate_limit(),
             no_spend_tracker(),
             models,
+            no_plugins(),
         );
         let response = app
             .oneshot(
@@ -905,6 +967,7 @@ mod tests {
             no_rate_limit(),
             no_spend_tracker(),
             no_models(),
+            no_plugins(),
         );
         let response = app
             .oneshot(
@@ -922,5 +985,43 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["data"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn pii_plugin_redacts_request_body_before_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "messages": [{ "content": "My SSN is [REDACTED] please respond" }]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let plugins: PluginChain = Arc::new(vec![
+            Box::new(PiiRedactionPlugin::default()) as Box<dyn Plugin>
+        ]);
+        let app = router(
+            connector(&server.uri()),
+            open_keys(),
+            open_pricing(),
+            no_cache(),
+            no_rate_limit(),
+            no_spend_tracker(),
+            no_models(),
+            plugins,
+        );
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"My SSN is 123-45-6789 please respond"}]}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
