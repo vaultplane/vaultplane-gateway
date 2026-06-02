@@ -46,6 +46,11 @@ pub struct Listen {
     pub address: String,
     /// Address the admin API binds to (health, status, metrics, reload).
     pub admin_address: String,
+    /// Optional TLS for the proxy listener. When set, the proxy listener
+    /// serves HTTPS using the given cert and key. The admin listener stays
+    /// plain HTTP (intended for cluster-internal access).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsConfig>,
 }
 
 impl Default for Listen {
@@ -53,8 +58,19 @@ impl Default for Listen {
         Self {
             address: "0.0.0.0:8080".to_string(),
             admin_address: "0.0.0.0:9091".to_string(),
+            tls: None,
         }
     }
+}
+
+/// TLS material for the proxy listener.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Path to a PEM-encoded certificate chain (server cert first, then any
+    /// intermediates).
+    pub cert_path: String,
+    /// Path to the PEM-encoded private key for the certificate.
+    pub key_path: String,
 }
 
 /// Upstream provider configuration. One provider family for now.

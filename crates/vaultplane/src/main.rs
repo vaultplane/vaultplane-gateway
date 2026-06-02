@@ -11,6 +11,7 @@ mod prom;
 mod proxy;
 mod runtime;
 mod telemetry;
+mod tls;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -120,6 +121,18 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
     }
     let runtime: RuntimeHandle = runtime::handle(initial_runtime);
 
+    // Load TLS material before binding so a bad cert path fails fast (and
+    // before `config` is moved into AppState).
+    let tls_config = if let Some(tls) = &config.listen.tls {
+        Some(
+            tls::build_rustls_config(tls)
+                .await
+                .context("failed to load TLS material for the proxy listener")?,
+        )
+    } else {
+        None
+    };
+
     let state = AppState::new(
         config,
         admin_token,
@@ -131,17 +144,20 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
         metrics_handle,
     );
 
-    let proxy_listener = TcpListener::bind(proxy_addr)
-        .await
-        .with_context(|| format!("failed to bind proxy listener on {proxy_addr}"))?;
     let admin_listener = TcpListener::bind(admin_addr)
         .await
         .with_context(|| format!("failed to bind admin listener on {admin_addr}"))?;
 
-    tracing::info!(%proxy_addr, "proxy API listening");
+    if tls_config.is_some() {
+        tracing::info!(%proxy_addr, "proxy API listening (TLS enabled)");
+    } else {
+        tracing::info!(%proxy_addr, "proxy API listening");
+    }
     tracing::info!(%admin_addr, "admin API listening");
 
-    // Configuration is loaded and both listeners are bound: ready to serve.
+    // Configuration is loaded and the admin listener is bound. The proxy
+    // listener is bound below (TLS or plain), and we set ready after both
+    // accept paths are wired up.
     state.set_ready(true);
 
     let proxy_app = proxy::router_with_runtime(runtime.clone(), keys, rate_limiter, spend_tracker);
@@ -161,11 +177,30 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
 
     let mut proxy_rx = rx.clone();
     let proxy_server = tokio::spawn(async move {
-        axum::serve(proxy_listener, proxy_app)
-            .with_graceful_shutdown(async move {
-                let _ = proxy_rx.changed().await;
-            })
-            .await
+        match tls_config {
+            Some(rustls) => {
+                let handle = axum_server::Handle::new();
+                let h = handle.clone();
+                tokio::spawn(async move {
+                    let _ = proxy_rx.changed().await;
+                    // 30s drain window matches the plain-HTTP path's implicit
+                    // behavior of awaiting the in-flight set.
+                    h.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
+                });
+                axum_server::bind_rustls(proxy_addr, rustls)
+                    .handle(handle)
+                    .serve(proxy_app.into_make_service())
+                    .await
+            }
+            None => {
+                let listener = TcpListener::bind(proxy_addr).await?;
+                axum::serve(listener, proxy_app)
+                    .with_graceful_shutdown(async move {
+                        let _ = proxy_rx.changed().await;
+                    })
+                    .await
+            }
+        }
     });
 
     let mut admin_rx = rx;
