@@ -39,6 +39,8 @@ futures = "0.3"
 getrandom = "0.2"
 hex = "0.4"
 hmac = "0.12"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 moka = { version = "0.12", features = ["future"] }
 opentelemetry = "0.27"
 opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client"] }

@@ -7,6 +7,7 @@
 //! swap the runtime state without dropping in-flight requests.
 
 mod admin;
+mod prom;
 mod proxy;
 mod runtime;
 mod telemetry;
@@ -101,6 +102,8 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
     let rate_limiter = Arc::new(RateLimiter::default());
     let spend_tracker = Arc::new(SpendTracker::default());
 
+    let metrics_handle = prom::install();
+
     let initial_runtime = runtime::build_runtime(&config).context("failed to build runtime")?;
     if !config.models.is_empty() {
         tracing::info!(count = config.models.len(), "loaded model registry");
@@ -125,6 +128,7 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
         spend_tracker.clone(),
         runtime.clone(),
         config_path.clone(),
+        metrics_handle,
     );
 
     let proxy_listener = TcpListener::bind(proxy_addr)

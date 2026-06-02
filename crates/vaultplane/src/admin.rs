@@ -12,11 +12,12 @@ use std::time::Instant;
 use axum::{
     Json, Router,
     extract::{Path, Request, State},
-    http::StatusCode,
+    http::{StatusCode, header::CONTENT_TYPE},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
+use metrics_exporter_prometheus::PrometheusHandle;
 use serde::{Deserialize, Serialize};
 use vaultplane_core::auth::{
     KeyStore, RateLimiter, SpendLimit, SpendTracker, VirtualKey, constant_time_eq, generate_key,
@@ -24,6 +25,9 @@ use vaultplane_core::auth::{
 use vaultplane_core::config::Config;
 
 use crate::runtime::{self, RuntimeHandle};
+
+/// Content type for the Prometheus text exposition format (version 0.0.4).
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// Shared state for the admin API.
 #[derive(Clone)]
@@ -40,6 +44,9 @@ pub struct AppState {
     /// /admin/config/reload` re-reads from this path; without it the endpoint
     /// returns 503 because there is nothing to reload from.
     config_path: Option<PathBuf>,
+    /// Handle to the global Prometheus recorder, used to render the snapshot
+    /// served by `GET /admin/metrics`.
+    metrics: PrometheusHandle,
 }
 
 impl AppState {
@@ -53,6 +60,7 @@ impl AppState {
         spend_tracker: Arc<SpendTracker>,
         runtime: RuntimeHandle,
         config_path: Option<PathBuf>,
+        metrics: PrometheusHandle,
     ) -> Self {
         Self {
             started_at: Instant::now(),
@@ -64,6 +72,7 @@ impl AppState {
             spend_tracker,
             runtime,
             config_path,
+            metrics,
         }
     }
 
@@ -78,6 +87,7 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/admin/status", get(status))
+        .route("/admin/metrics", get(metrics))
         .route("/admin/keys", get(list_keys).post(create_key))
         .route("/admin/keys/{id}", delete(delete_key))
         .route("/admin/config/reload", post(reload_config))
@@ -148,6 +158,14 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         admin_address: state.config.listen.admin_address.clone(),
         key_count: state.keys.len(),
     })
+}
+
+/// Render the current snapshot of the Prometheus registry in the text
+/// exposition format. Gated by the admin token because the rest of the admin
+/// surface is; Prometheus can authenticate scrapes with `bearer_token_file`.
+async fn metrics(State(state): State<AppState>) -> Response {
+    let body = state.metrics.render();
+    ([(CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)], body).into_response()
 }
 
 /// A non-secret view of a virtual key. The hash is intentionally excluded so
@@ -312,7 +330,7 @@ mod tests {
     use tower::ServiceExt;
     use vaultplane_core::config::Config;
 
-    use crate::runtime;
+    use crate::{prom, runtime};
 
     fn empty_runtime() -> RuntimeHandle {
         runtime::handle(runtime::build_runtime(&Config::default()).unwrap())
@@ -335,6 +353,7 @@ mod tests {
             Arc::new(SpendTracker::default()),
             runtime,
             config_path,
+            prom::install(),
         )
     }
 
@@ -430,6 +449,7 @@ mod tests {
             ("GET", "/admin/keys"),
             ("POST", "/admin/keys"),
             ("DELETE", "/admin/keys/vp_unknown"),
+            ("GET", "/admin/metrics"),
         ] {
             let response = app
                 .clone()
@@ -574,6 +594,39 @@ mod tests {
         assert_eq!(models.len(), 1, "new runtime has one model");
         assert_eq!(models[0].id, "smart");
         assert_eq!(models[0].provider, "openai");
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_renders_prometheus_text_format() {
+        let s = state(Some("secret"));
+        let app = router(s);
+
+        // Record something so the snapshot is non-empty and includes our prefix.
+        ::metrics::counter!("vaultplane_requests_total", "provider" => "test", "model" => "m", "status" => "200").increment(1);
+
+        let response = app
+            .oneshot(request("GET", "/admin/metrics", Some("secret"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.starts_with("text/plain"),
+            "expected text/plain content type, got {ct}"
+        );
+        let bytes = body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.contains("vaultplane_requests_total"),
+            "metrics snapshot missing recorded counter:\n{text}"
+        );
     }
 
     #[tokio::test]

@@ -30,6 +30,7 @@ use vaultplane_core::plugin::{Decision, Plugin, PluginRequest, RejectInfo};
 use vaultplane_core::provider::{BodyStream, ChatRequest, Usage};
 use vaultplane_core::stream_observer::UsageObservingStream;
 
+use crate::prom::{label_values, names};
 use crate::runtime::RuntimeHandle;
 // The test-only `router()` convenience constructor wraps individual fields into
 // a `Runtime`; production callers use `router_with_runtime` with a handle they
@@ -42,6 +43,55 @@ use vaultplane_core::plugin::PluginChain;
 use vaultplane_core::provider::Connector;
 
 const CACHE_HEADER: &str = "x-vaultplane-cache";
+
+/// Increment the rejection counter with the given reason.
+fn record_rejection(reason: &'static str) {
+    metrics::counter!(names::REJECTIONS_TOTAL, "reason" => reason).increment(1);
+}
+
+/// Record one completed request: bump the request count, the duration
+/// histogram, and (when a cost is present) the cumulative cents counter.
+fn record_completion(
+    provider: &str,
+    model: &str,
+    status: u16,
+    cache_label: &'static str,
+    duration_seconds: f64,
+    cost_usd: Option<f64>,
+) {
+    let provider = provider.to_string();
+    let model = model.to_string();
+    let status = status.to_string();
+    metrics::counter!(
+        names::REQUESTS_TOTAL,
+        "provider" => provider.clone(),
+        "model" => model.clone(),
+        "status" => status,
+    )
+    .increment(1);
+    metrics::histogram!(
+        names::REQUEST_DURATION_SECONDS,
+        "provider" => provider.clone(),
+        "model" => model.clone(),
+        "cache" => cache_label,
+    )
+    .record(duration_seconds);
+    if let Some(cost) = cost_usd {
+        // Round to nearest cent. Negative or NaN costs (which should never
+        // happen but would saturate-cast to zero) are dropped.
+        if cost.is_finite() && cost > 0.0 {
+            let cents = (cost * 100.0).round() as u64;
+            if cents > 0 {
+                metrics::counter!(
+                    names::COST_CENTS_TOTAL,
+                    "provider" => provider,
+                    "model" => model,
+                )
+                .increment(cents);
+            }
+        }
+    }
+}
 
 /// Shared state for the proxy API.
 ///
@@ -142,17 +192,22 @@ async fn authenticate(
             .and_then(|token| state.keys.authenticate(token))
         {
             Some(key) => key,
-            None => return error(StatusCode::UNAUTHORIZED, "missing or invalid virtual key"),
+            None => {
+                record_rejection(label_values::REASON_AUTH);
+                return error(StatusCode::UNAUTHORIZED, "missing or invalid virtual key");
+            }
         }
     };
 
     if key.is_expired() {
+        record_rejection(label_values::REASON_EXPIRED);
         return error(StatusCode::UNAUTHORIZED, "virtual key has expired");
     }
 
     if let Some(rps) = key.rate_limit_rps
         && !state.rate_limiter.check(&key.identifier(), rps)
     {
+        record_rejection(label_values::REASON_RATE_LIMIT);
         return error(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded");
     }
 
@@ -237,6 +292,7 @@ async fn chat_completions(
     );
 
     if !key.allows_model(&virtual_model) {
+        record_rejection(label_values::REASON_FORBIDDEN_MODEL);
         span.record("vaultplane.cache.hit", false);
         span.record("http.response.status_code", 403_u64);
         span.record("duration_ms", start.elapsed().as_millis() as u64);
@@ -251,6 +307,7 @@ async fn chat_completions(
     if let Some(limit) = &key.spend_limit
         && !state.spend_tracker.pre_check(&key.identifier(), limit)
     {
+        record_rejection(label_values::REASON_SPEND_LIMIT);
         span.record("vaultplane.cache.hit", false);
         span.record("http.response.status_code", 402_u64);
         span.record("duration_ms", start.elapsed().as_millis() as u64);
@@ -266,6 +323,7 @@ async fn chat_completions(
     let body = match run_plugins(&runtime.plugins, body) {
         Ok(body) => body,
         Err(info) => {
+            record_rejection(label_values::REASON_PLUGIN);
             tracing::warn!(
                 reason = %info.reason,
                 status = info.status_code,
@@ -309,6 +367,7 @@ async fn chat_completions(
             span.record("vaultplane.provider.attempts", upstream.attempts as u64);
             span.record("http.response.status_code", upstream.status as u64);
             span.record("vaultplane.cache.hit", false);
+            let mut cost_for_metrics: Option<f64> = None;
             if let Some(usage) = &upstream.usage {
                 span.record("gen_ai.usage.input_tokens", usage.prompt_tokens as u64);
                 span.record("gen_ai.usage.output_tokens", usage.completion_tokens as u64);
@@ -316,6 +375,7 @@ async fn chat_completions(
                     compute_cost(&runtime.pricing, &upstream.provider, &upstream.model, usage)
                 {
                     span.record("vaultplane.cost_usd", cost);
+                    cost_for_metrics = Some(cost);
                     if let Some(limit) = &key.spend_limit {
                         state
                             .spend_tracker
@@ -324,6 +384,15 @@ async fn chat_completions(
                 }
             }
             span.record("duration_ms", duration_ms);
+
+            record_completion(
+                &upstream.provider,
+                &upstream.model,
+                upstream.status,
+                label_values::CACHE_MISS,
+                start.elapsed().as_secs_f64(),
+                cost_for_metrics,
+            );
 
             let should_cache =
                 cache_key.is_some() && runtime.cache.is_some() && upstream.status == 200;
@@ -386,6 +455,7 @@ async fn chat_completions(
             span.record("vaultplane.cache.hit", false);
             span.record("http.response.status_code", 502_u64);
             span.record("duration_ms", duration_ms);
+            record_rejection(label_values::REASON_UPSTREAM_ERROR);
             error(StatusCode::BAD_GATEWAY, "upstream request failed")
         }
     }
@@ -424,6 +494,17 @@ fn serve_from_cache(
         }
     }
     span.record("duration_ms", start.elapsed().as_millis() as u64);
+
+    // Cache hits never incurred upstream spend, so cost is intentionally not
+    // forwarded to the metrics counter; the request count and duration are.
+    record_completion(
+        &cached.provider,
+        &cached.model,
+        cached.status,
+        label_values::CACHE_HIT,
+        start.elapsed().as_secs_f64(),
+        None,
+    );
 
     build_response(
         cached.status,
