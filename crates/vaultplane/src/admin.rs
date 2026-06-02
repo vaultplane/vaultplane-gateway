@@ -4,6 +4,7 @@
 //! cluster-internal access. Protected endpoints require the static admin token
 //! when one is configured; health and readiness probes are always open.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -14,13 +15,15 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get},
+    routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 use vaultplane_core::auth::{
     KeyStore, RateLimiter, SpendLimit, SpendTracker, VirtualKey, constant_time_eq, generate_key,
 };
 use vaultplane_core::config::Config;
+
+use crate::runtime::{self, RuntimeHandle};
 
 /// Shared state for the admin API.
 #[derive(Clone)]
@@ -32,16 +35,24 @@ pub struct AppState {
     keys: Arc<KeyStore>,
     rate_limiter: Arc<RateLimiter>,
     spend_tracker: Arc<SpendTracker>,
+    runtime: RuntimeHandle,
+    /// Path to the YAML config file used at startup, if any. `POST
+    /// /admin/config/reload` re-reads from this path; without it the endpoint
+    /// returns 503 because there is nothing to reload from.
+    config_path: Option<PathBuf>,
 }
 
 impl AppState {
     /// Create admin state for a freshly started gateway.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         admin_token: Option<String>,
         keys: Arc<KeyStore>,
         rate_limiter: Arc<RateLimiter>,
         spend_tracker: Arc<SpendTracker>,
+        runtime: RuntimeHandle,
+        config_path: Option<PathBuf>,
     ) -> Self {
         Self {
             started_at: Instant::now(),
@@ -51,6 +62,8 @@ impl AppState {
             keys,
             rate_limiter,
             spend_tracker,
+            runtime,
+            config_path,
         }
     }
 
@@ -67,6 +80,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/status", get(status))
         .route("/admin/keys", get(list_keys).post(create_key))
         .route("/admin/keys/{id}", delete(delete_key))
+        .route("/admin/config/reload", post(reload_config))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin_token,
@@ -252,22 +266,75 @@ async fn delete_key(State(state): State<AppState>, Path(id): Path<String>) -> Re
     }
 }
 
+#[derive(Debug, Serialize)]
+struct ReloadResponse {
+    status: &'static str,
+    config_path: String,
+}
+
+/// Re-read the configured YAML file and atomically swap the runtime.
+///
+/// On validation failure the old runtime stays in place and the endpoint
+/// returns 400 with the error text. Without a `--config` path at startup the
+/// endpoint returns 503: there is nothing to reload from.
+async fn reload_config(State(state): State<AppState>) -> Response {
+    let Some(path) = state.config_path.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config reload requires the gateway to have been started with --config",
+        )
+            .into_response();
+    };
+
+    match runtime::reload(&state.runtime, Some(path)) {
+        Ok(()) => {
+            tracing::info!(config_path = %path.display(), "config reloaded");
+            Json(ReloadResponse {
+                status: "reloaded",
+                config_path: path.display().to_string(),
+            })
+            .into_response()
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "config reload rejected");
+            (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::{self, Body};
     use axum::http::{Request, StatusCode};
     use serde_json::Value;
+    use std::io::Write;
     use tower::ServiceExt;
     use vaultplane_core::config::Config;
 
+    use crate::runtime;
+
+    fn empty_runtime() -> RuntimeHandle {
+        runtime::handle(runtime::build_runtime(&Config::default()).unwrap())
+    }
+
     fn state(token: Option<&str>) -> AppState {
+        state_with(token, empty_runtime(), None)
+    }
+
+    fn state_with(
+        token: Option<&str>,
+        runtime: RuntimeHandle,
+        config_path: Option<PathBuf>,
+    ) -> AppState {
         AppState::new(
             Config::default(),
             token.map(str::to_string),
             Arc::new(KeyStore::default()),
             Arc::new(RateLimiter::default()),
             Arc::new(SpendTracker::default()),
+            runtime,
+            config_path,
         )
     }
 
@@ -453,5 +520,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn config_reload_without_a_config_path_returns_503() {
+        let s = state(Some("secret"));
+        let app = router(s);
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/config/reload",
+                Some("secret"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn config_reload_swaps_the_runtime_for_a_valid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vaultplane.yaml");
+        std::fs::write(
+            &path,
+            "models:\n  - name: smart\n    primary: { provider: openai, model: gpt-4o }\n",
+        )
+        .unwrap();
+
+        let runtime = empty_runtime();
+        let s = state_with(Some("secret"), runtime.clone(), Some(path.clone()));
+        let app = router(s);
+
+        assert!(
+            runtime.load().models.is_empty(),
+            "initial runtime has no models"
+        );
+
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/config/reload",
+                Some("secret"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["status"], "reloaded");
+
+        let models = &runtime.load().models;
+        assert_eq!(models.len(), 1, "new runtime has one model");
+        assert_eq!(models[0].id, "smart");
+        assert_eq!(models[0].provider, "openai");
+    }
+
+    #[tokio::test]
+    async fn config_reload_keeps_old_runtime_on_invalid_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vaultplane.yaml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"this: is: not: valid yaml: [unterminated\n")
+            .unwrap();
+
+        let runtime = empty_runtime();
+        let s = state_with(Some("secret"), runtime.clone(), Some(path));
+        let app = router(s);
+
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/admin/config/reload",
+                Some("secret"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            runtime.load().models.is_empty(),
+            "old runtime is preserved on validation failure"
+        );
     }
 }

@@ -28,6 +28,7 @@ vaultplane-plugin-sdk = { path = "crates/vaultplane-plugin-sdk" }
 # Shared third-party dependencies. Versions are centralized here so every crate
 # stays in lockstep; individual crates opt in with `dep.workspace = true`.
 anyhow = "1"
+arc-swap = "1"
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
@@ -54,6 +55,7 @@ tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
 wiremock = "0.6"
 
 [profile.release]

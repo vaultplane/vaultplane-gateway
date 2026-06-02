@@ -1,15 +1,18 @@
 //! VaultPlane Gateway data plane entry point.
 //!
-//! Loads layered configuration, builds the provider connector and the virtual key
-//! store, binds the OpenAI-compatible proxy API and the admin API, and serves until
-//! a shutdown signal arrives.
+//! Loads layered configuration, builds the provider connectors and the virtual
+//! key store, binds the OpenAI-compatible proxy API and the admin API, and
+//! serves until a shutdown signal arrives. SIGHUP (on Unix) and
+//! `POST /admin/config/reload` re-read the configured YAML file and atomically
+//! swap the runtime state without dropping in-flight requests.
 
 mod admin;
 mod proxy;
+mod runtime;
 mod telemetry;
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -18,17 +21,10 @@ use axum::http::header::AUTHORIZATION;
 use clap::Parser;
 use tokio::net::TcpListener;
 use vaultplane_core::auth::{KeyStore, RateLimiter, SpendTracker};
-use vaultplane_core::cache::ResponseCache;
-use vaultplane_core::config::{Config, PluginConfig};
-use vaultplane_core::plugin::{PiiRedactionPlugin, Plugin, PluginChain};
-use vaultplane_core::provider::Connector;
-use vaultplane_core::provider::anthropic::AnthropicConnector;
-use vaultplane_core::provider::azure::AzureConnector;
-use vaultplane_core::provider::bedrock::BedrockConnector;
-use vaultplane_core::provider::openai::OpenAiConnector;
-use vaultplane_core::provider::registry::Registry;
+use vaultplane_core::config::Config;
 
 use crate::admin::AppState;
+use crate::runtime::RuntimeHandle;
 
 /// VaultPlane Gateway: every model call, on policy.
 #[derive(Debug, Parser)]
@@ -44,15 +40,15 @@ async fn main() -> anyhow::Result<()> {
     let tracer_provider = telemetry::init()?;
 
     let args = Args::parse();
-    let config = Config::load(args.config.as_deref().map(std::path::Path::new))
-        .context("failed to load configuration")?;
+    let config_path = args.config.as_deref().map(PathBuf::from);
+    let config = Config::load(config_path.as_deref()).context("failed to load configuration")?;
 
     tracing::info!(
         version = vaultplane_core::VERSION,
         "VaultPlane Gateway starting"
     );
 
-    let result = run(config).await;
+    let result = run(config, config_path).await;
     telemetry::shutdown(tracer_provider);
     result
 }
@@ -64,80 +60,6 @@ pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .to_str()
         .ok()?
         .strip_prefix("Bearer ")
-}
-
-/// Read a provider API key from the named environment variable, warning if unset.
-fn read_key(var: &str, provider: &str) -> String {
-    let key = std::env::var(var).unwrap_or_default();
-    if key.is_empty() {
-        tracing::warn!(
-            provider,
-            var,
-            "API key is not set; requests to this provider will fail"
-        );
-    }
-    key
-}
-
-/// Read an optional environment variable, returning `None` when unset or empty.
-fn optional_env(var: &str) -> Option<String> {
-    let value = std::env::var(var).unwrap_or_default();
-    if value.is_empty() { None } else { Some(value) }
-}
-
-/// Build the provider connectors and the model registry from configuration.
-fn build_router(config: &Config) -> anyhow::Result<Arc<dyn Connector>> {
-    let openai_cfg = &config.providers.openai;
-    let openai: Arc<dyn Connector> = Arc::new(
-        OpenAiConnector::new(
-            openai_cfg.base_url.clone(),
-            read_key(&openai_cfg.api_key_env, "openai"),
-        )
-        .context("failed to build OpenAI connector")?,
-    );
-
-    let anthropic_cfg = &config.providers.anthropic;
-    let anthropic: Arc<dyn Connector> = Arc::new(
-        AnthropicConnector::new(
-            anthropic_cfg.base_url.clone(),
-            read_key(&anthropic_cfg.api_key_env, "anthropic"),
-        )
-        .context("failed to build Anthropic connector")?,
-    );
-
-    let azure_cfg = &config.providers.azure;
-    let azure: Arc<dyn Connector> = Arc::new(
-        AzureConnector::new(
-            azure_cfg.base_url.clone(),
-            read_key(&azure_cfg.api_key_env, "azure"),
-            azure_cfg.api_version.clone(),
-        )
-        .context("failed to build Azure OpenAI connector")?,
-    );
-
-    let bedrock_cfg = &config.providers.bedrock;
-    let bedrock: Arc<dyn Connector> = Arc::new(
-        BedrockConnector::new(
-            bedrock_cfg.region.clone(),
-            read_key(&bedrock_cfg.access_key_env, "bedrock"),
-            std::env::var(&bedrock_cfg.secret_key_env).unwrap_or_default(),
-            optional_env(&bedrock_cfg.session_token_env),
-        )
-        .context("failed to build Bedrock connector")?,
-    );
-
-    let connectors = HashMap::from([
-        ("openai".to_string(), openai),
-        ("anthropic".to_string(), anthropic),
-        ("azure".to_string(), azure),
-        ("bedrock".to_string(), bedrock),
-    ]);
-    let registry =
-        Registry::new(connectors, &config.models).context("failed to build model registry")?;
-    if !config.models.is_empty() {
-        tracing::info!(count = config.models.len(), "loaded model registry");
-    }
-    Ok(Arc::new(registry))
 }
 
 /// Read the admin token from the configured environment variable.
@@ -154,7 +76,7 @@ fn read_admin_token(config: &Config) -> Option<String> {
     }
 }
 
-async fn run(config: Config) -> anyhow::Result<()> {
+async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let proxy_addr: SocketAddr = config
         .listen
         .address
@@ -167,7 +89,6 @@ async fn run(config: Config) -> anyhow::Result<()> {
         )
     })?;
 
-    let connector = build_router(&config)?;
     let admin_token = read_admin_token(&config);
 
     let keys = Arc::new(KeyStore::new(config.auth.keys.clone()));
@@ -177,51 +98,24 @@ async fn run(config: Config) -> anyhow::Result<()> {
         tracing::info!(count = keys.len(), "loaded virtual keys");
     }
 
-    let pricing = Arc::new(config.pricing.clone());
-
     let rate_limiter = Arc::new(RateLimiter::default());
     let spend_tracker = Arc::new(SpendTracker::default());
 
-    let cache = if config.cache.enabled {
-        let size_bytes = config.cache.size_mb.saturating_mul(1024 * 1024);
-        let ttl = std::time::Duration::from_secs(config.cache.ttl_seconds);
+    let initial_runtime = runtime::build_runtime(&config).context("failed to build runtime")?;
+    if !config.models.is_empty() {
+        tracing::info!(count = config.models.len(), "loaded model registry");
+    }
+    if config.cache.enabled {
         tracing::info!(
             size_mb = config.cache.size_mb,
             ttl_seconds = config.cache.ttl_seconds,
             "response cache enabled"
         );
-        Some(Arc::new(ResponseCache::new(size_bytes, ttl)))
-    } else {
-        None
-    };
-
-    let models = Arc::new(
-        config
-            .models
-            .iter()
-            .map(|m| proxy::RegisteredModel {
-                id: m.name.clone(),
-                provider: m.primary.provider.clone(),
-            })
-            .collect::<Vec<_>>(),
-    );
-
-    let plugins: PluginChain = Arc::new(
-        config
-            .plugins
-            .iter()
-            .map(|p| -> Box<dyn Plugin> {
-                match p {
-                    PluginConfig::PiiRedaction(c) => {
-                        Box::new(PiiRedactionPlugin::new(&c.patterns, c.replacement.clone()))
-                    }
-                }
-            })
-            .collect(),
-    );
+    }
     if !config.plugins.is_empty() {
         tracing::info!(count = config.plugins.len(), "loaded inline plugins");
     }
+    let runtime: RuntimeHandle = runtime::handle(initial_runtime);
 
     let state = AppState::new(
         config,
@@ -229,6 +123,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
         keys.clone(),
         rate_limiter.clone(),
         spend_tracker.clone(),
+        runtime.clone(),
+        config_path.clone(),
     );
 
     let proxy_listener = TcpListener::bind(proxy_addr)
@@ -244,16 +140,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // Configuration is loaded and both listeners are bound: ready to serve.
     state.set_ready(true);
 
-    let proxy_app = proxy::router(
-        connector,
-        keys,
-        pricing,
-        cache,
-        rate_limiter,
-        spend_tracker,
-        models,
-        plugins,
-    );
+    let proxy_app = proxy::router_with_runtime(runtime.clone(), keys, rate_limiter, spend_tracker);
     let admin_app = admin::router(state);
 
     // Broadcast a single shutdown signal to both servers for a graceful drain.
@@ -263,6 +150,10 @@ async fn run(config: Config) -> anyhow::Result<()> {
         tracing::info!("shutdown signal received; draining in-flight requests");
         let _ = tx.send(true);
     });
+
+    // SIGHUP triggers the same reload path the admin API exposes. Unix only;
+    // on Windows operators use POST /admin/config/reload.
+    spawn_reload_signal(runtime.clone(), config_path);
 
     let mut proxy_rx = rx.clone();
     let proxy_server = tokio::spawn(async move {
@@ -289,6 +180,32 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// Install a SIGHUP handler that re-reads the config file and swaps the runtime
+/// in place. Unix only.
+#[cfg(unix)]
+fn spawn_reload_signal(runtime: RuntimeHandle, config_path: Option<PathBuf>) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    tokio::spawn(async move {
+        let Ok(mut hup) = signal(SignalKind::hangup()) else {
+            tracing::warn!("failed to install SIGHUP handler; config hot-reload disabled");
+            return;
+        };
+        while hup.recv().await.is_some() {
+            match runtime::reload(&runtime, config_path.as_deref()) {
+                Ok(()) => tracing::info!("config reloaded via SIGHUP"),
+                Err(err) => tracing::error!(error = %err, "SIGHUP config reload failed"),
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_reload_signal(_runtime: RuntimeHandle, _config_path: Option<PathBuf>) {
+    // SIGHUP is not available on Windows; operators trigger reload via the
+    // admin API endpoint instead.
 }
 
 /// Resolve when the process receives Ctrl-C or, on Unix, SIGTERM.

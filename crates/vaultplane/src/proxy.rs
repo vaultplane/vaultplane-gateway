@@ -26,35 +26,46 @@ use serde_json::json;
 use vaultplane_core::auth::{KeyStore, RateLimiter, SpendTracker, VirtualKey};
 use vaultplane_core::cache::{CachedResponse, ResponseCache};
 use vaultplane_core::config::Pricing;
-use vaultplane_core::plugin::{Decision, Plugin, PluginChain, PluginRequest, RejectInfo};
-use vaultplane_core::provider::{BodyStream, ChatRequest, Connector, Usage};
+use vaultplane_core::plugin::{Decision, Plugin, PluginRequest, RejectInfo};
+use vaultplane_core::provider::{BodyStream, ChatRequest, Usage};
 use vaultplane_core::stream_observer::UsageObservingStream;
+
+use crate::runtime::RuntimeHandle;
+// The test-only `router()` convenience constructor wraps individual fields into
+// a `Runtime`; production callers use `router_with_runtime` with a handle they
+// own. These imports back that test-only constructor.
+#[cfg(test)]
+use crate::runtime::{self, RegisteredModel, Runtime};
+#[cfg(test)]
+use vaultplane_core::plugin::PluginChain;
+#[cfg(test)]
+use vaultplane_core::provider::Connector;
 
 const CACHE_HEADER: &str = "x-vaultplane-cache";
 
-/// A virtual model entry surfaced from the registry by `GET /v1/models`.
-#[derive(Clone, Debug)]
-pub struct RegisteredModel {
-    pub id: String,
-    pub provider: String,
-}
-
 /// Shared state for the proxy API.
+///
+/// `runtime` is hot-swappable: a config reload replaces it atomically, and each
+/// request loads the current snapshot once at the top of the handler. The
+/// keystore, rate limiter, and spend tracker are NOT swapped on reload; they
+/// hold per-key state that must persist across configuration changes.
 #[derive(Clone)]
 struct ProxyState {
-    connector: Arc<dyn Connector>,
+    runtime: RuntimeHandle,
     keys: Arc<KeyStore>,
-    pricing: Arc<Pricing>,
-    cache: Option<Arc<ResponseCache>>,
     rate_limiter: Arc<RateLimiter>,
     spend_tracker: Arc<SpendTracker>,
-    models: Arc<Vec<RegisteredModel>>,
-    plugins: PluginChain,
 }
 
 /// Build the proxy API router around a provider connector, key store, pricing,
 /// optional response cache, rate limiter, spend tracker, and the registered
 /// virtual model list for `GET /v1/models`.
+///
+/// Convenience wrapper used by tests: bundles the runtime fields into a
+/// freshly built [`Runtime`] and a private swap handle. Production callers
+/// should construct the runtime separately and use [`router_with_runtime`] so
+/// the same handle can be shared with the reload path.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn router(
     connector: Arc<dyn Connector>,
@@ -66,15 +77,30 @@ pub fn router(
     models: Arc<Vec<RegisteredModel>>,
     plugins: PluginChain,
 ) -> Router {
-    let state = ProxyState {
+    let runtime = runtime::handle(Runtime {
         connector,
-        keys,
         pricing,
         cache,
+        plugins,
+        models,
+    });
+    router_with_runtime(runtime, keys, rate_limiter, spend_tracker)
+}
+
+/// Build the proxy API router around an externally owned [`RuntimeHandle`].
+/// The handle is shared with the admin module so a configuration reload swaps
+/// the runtime in place for the live router.
+pub fn router_with_runtime(
+    runtime: RuntimeHandle,
+    keys: Arc<KeyStore>,
+    rate_limiter: Arc<RateLimiter>,
+    spend_tracker: Arc<SpendTracker>,
+) -> Router {
+    let state = ProxyState {
+        runtime,
+        keys,
         rate_limiter,
         spend_tracker,
-        models,
-        plugins,
     };
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -86,7 +112,8 @@ pub fn router(
 }
 
 async fn list_models(State(state): State<ProxyState>) -> Response {
-    let data: Vec<serde_json::Value> = state
+    let runtime = state.runtime.load();
+    let data: Vec<serde_json::Value> = runtime
         .models
         .iter()
         .map(|m| {
@@ -187,6 +214,10 @@ async fn chat_completions(
     let meta: ChatMeta = serde_json::from_slice(&body).unwrap_or_default();
     let virtual_model = meta.model.unwrap_or_default();
 
+    // Snapshot the current runtime once; a config reload swaps the handle but
+    // this request keeps the bundle it loaded here for the rest of its life.
+    let runtime = state.runtime.load();
+
     let span = tracing::info_span!(
         "chat",
         "gen_ai.system" = tracing::field::Empty,
@@ -232,7 +263,7 @@ async fn chat_completions(
     // Run inline plugins (e.g. PII redaction) before the cache and the upstream
     // dispatch. A Modify decision replaces the body for the rest of the request;
     // a Reject decision shortcircuits with the plugin's status and reason.
-    let body = match run_plugins(&state.plugins, body) {
+    let body = match run_plugins(&runtime.plugins, body) {
         Ok(body) => body,
         Err(info) => {
             tracing::warn!(
@@ -256,10 +287,10 @@ async fn chat_completions(
 
     // Cache lookup. Cache hits do not count against the spend budget (no upstream
     // spend incurred); their cost on the span is informational.
-    if let (Some(cache), Some(key_str)) = (state.cache.as_ref(), cache_key.as_ref())
+    if let (Some(cache), Some(key_str)) = (runtime.cache.as_ref(), cache_key.as_ref())
         && let Some(cached) = cache.get(key_str).await
     {
-        return serve_from_cache(&state.pricing, &span, &cached, start);
+        return serve_from_cache(&runtime.pricing, &span, &cached, start);
     }
 
     let request = ChatRequest {
@@ -268,7 +299,7 @@ async fn chat_completions(
         body,
     };
 
-    let result = state.connector.chat(request).await;
+    let result = runtime.connector.chat(request).await;
     let duration_ms = start.elapsed().as_millis() as u64;
 
     match result {
@@ -282,7 +313,7 @@ async fn chat_completions(
                 span.record("gen_ai.usage.input_tokens", usage.prompt_tokens as u64);
                 span.record("gen_ai.usage.output_tokens", usage.completion_tokens as u64);
                 if let Some(cost) =
-                    compute_cost(&state.pricing, &upstream.provider, &upstream.model, usage)
+                    compute_cost(&runtime.pricing, &upstream.provider, &upstream.model, usage)
                 {
                     span.record("vaultplane.cost_usd", cost);
                     if let Some(limit) = &key.spend_limit {
@@ -295,7 +326,7 @@ async fn chat_completions(
             span.record("duration_ms", duration_ms);
 
             let should_cache =
-                cache_key.is_some() && state.cache.is_some() && upstream.status == 200;
+                cache_key.is_some() && runtime.cache.is_some() && upstream.status == 200;
 
             if should_cache {
                 match collect_body(upstream.body).await {
@@ -308,7 +339,7 @@ async fn chat_completions(
                             model: upstream.model.clone(),
                             usage: upstream.usage,
                         });
-                        if let (Some(cache), Some(key_str)) = (state.cache.as_ref(), cache_key) {
+                        if let (Some(cache), Some(key_str)) = (runtime.cache.as_ref(), cache_key) {
                             cache.insert(key_str, cached.clone()).await;
                         }
                         build_response(
@@ -331,7 +362,7 @@ async fn chat_completions(
                     UsageObservingStream::new(
                         upstream.body,
                         span.clone(),
-                        state.pricing.clone(),
+                        runtime.pricing.clone(),
                         state.spend_tracker.clone(),
                         key.identifier(),
                         key.spend_limit,
