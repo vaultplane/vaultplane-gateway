@@ -14,7 +14,8 @@ use futures::StreamExt;
 
 use crate::error::{Error, Result};
 use crate::provider::{
-    BodyStream, ChatRequest, ChatResponse, Connector, parse_openai_usage, single_chunk,
+    BodyStream, ChatRequest, ChatResponse, Connector, EmbeddingsRequest, parse_openai_usage,
+    single_chunk,
 };
 
 /// Connector for the OpenAI REST API and OpenAI-compatible self-hosted servers.
@@ -115,12 +116,47 @@ impl Connector for OpenAiConnector {
             attempts: 1,
         })
     }
+
+    async fn embeddings(&self, request: EmbeddingsRequest) -> Result<ChatResponse> {
+        let url = format!("{}/v1/embeddings", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(rewrite_model(&request.body, &request.model))
+            .send()
+            .await
+            .map_err(|e| Error::Provider(format!("request to OpenAI failed: {e}")))?;
+
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+
+        let upstream_body = response
+            .bytes()
+            .await
+            .map_err(|e| Error::Provider(format!("reading OpenAI response failed: {e}")))?;
+        let usage = parse_openai_usage(&upstream_body);
+        Ok(ChatResponse {
+            status,
+            content_type,
+            body: single_chunk(upstream_body.to_vec()),
+            provider: "openai".to_string(),
+            model: request.model,
+            usage,
+            attempts: 1,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::OpenAiConnector;
-    use crate::provider::{ChatRequest, Connector};
+    use crate::provider::{ChatRequest, Connector, EmbeddingsRequest};
     use bytes::Bytes;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -166,6 +202,37 @@ mod tests {
         let usage = response.usage.expect("usage on a non-streaming response");
         assert_eq!(usage.prompt_tokens, 7);
         assert_eq!(usage.completion_tokens, 11);
+    }
+
+    #[tokio::test]
+    async fn embeddings_response_includes_prompt_token_usage() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"object":"list","data":[{"object":"embedding","embedding":[0.1]}],"usage":{"prompt_tokens":4,"total_tokens":4}}"#,
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let connector = OpenAiConnector::new(server.uri(), "test-key").unwrap();
+        let response = connector
+            .embeddings(EmbeddingsRequest {
+                model: "text-embedding-3-small".to_string(),
+                body: Bytes::from_static(b"{\"input\":\"hi\"}"),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        let usage = response.usage.expect("usage on an embeddings response");
+        assert_eq!(usage.prompt_tokens, 4);
+        // Embeddings have no output tokens; the parser defaults to zero.
+        assert_eq!(usage.completion_tokens, 0);
     }
 
     #[tokio::test]

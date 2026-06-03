@@ -487,7 +487,7 @@ impl Connector for AnthropicConnector {
 #[cfg(test)]
 mod tests {
     use super::{ANTHROPIC_VERSION, AnthropicConnector};
-    use crate::provider::{BodyStream, ChatRequest, Connector};
+    use crate::provider::{BodyStream, ChatRequest, Connector, EmbeddingsRequest};
     use bytes::Bytes;
     use futures::StreamExt;
     use serde_json::{Value, json};
@@ -630,5 +630,31 @@ mod tests {
             text.contains("\"completion_tokens\":5"),
             "missing usage chunk completion_tokens: {text}"
         );
+    }
+
+    /// Anthropic's Messages API has no embeddings endpoint, so the connector
+    /// inherits the trait's default "not supported" error.
+    #[tokio::test]
+    async fn embeddings_are_unsupported_for_anthropic() {
+        let connector =
+            AnthropicConnector::new("http://127.0.0.1:1".to_string(), "test-key".to_string())
+                .unwrap();
+        match connector
+            .embeddings(EmbeddingsRequest {
+                model: "claude-3-7-sonnet".to_string(),
+                body: Bytes::from_static(b"{}"),
+            })
+            .await
+        {
+            Err(err) => {
+                let message = format!("{err}");
+                assert!(
+                    message.contains("anthropic")
+                        && message.contains("does not support embeddings"),
+                    "expected 'does not support embeddings' error for anthropic, got: {message}"
+                );
+            }
+            Ok(_) => panic!("anthropic should reject embeddings as unsupported"),
+        }
     }
 }

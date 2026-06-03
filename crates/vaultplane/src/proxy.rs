@@ -27,7 +27,7 @@ use vaultplane_core::auth::{KeyStore, RateLimiter, SpendTracker, VirtualKey};
 use vaultplane_core::cache::{CachedResponse, ResponseCache};
 use vaultplane_core::config::Pricing;
 use vaultplane_core::plugin::{Decision, Plugin, PluginRequest, RejectInfo};
-use vaultplane_core::provider::{BodyStream, ChatRequest, Usage};
+use vaultplane_core::provider::{BodyStream, ChatRequest, EmbeddingsRequest, Usage};
 use vaultplane_core::stream_observer::UsageObservingStream;
 
 use crate::prom::{label_values, names};
@@ -154,7 +154,7 @@ pub fn router_with_runtime(
     };
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/embeddings", post(not_implemented))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(list_models))
         .fallback(fallback)
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
@@ -514,8 +514,179 @@ fn serve_from_cache(
     )
 }
 
-async fn not_implemented() -> Response {
-    error(StatusCode::NOT_IMPLEMENTED, "not yet implemented")
+/// The fields of an embeddings request the gateway reads before forwarding the rest.
+#[derive(Debug, Default, Deserialize)]
+struct EmbeddingsMeta {
+    model: Option<String>,
+}
+
+async fn embeddings(
+    State(state): State<ProxyState>,
+    Extension(key): Extension<VirtualKey>,
+    body: Bytes,
+) -> Response {
+    let start = Instant::now();
+    let meta: EmbeddingsMeta = serde_json::from_slice(&body).unwrap_or_default();
+    let virtual_model = meta.model.unwrap_or_default();
+
+    let runtime = state.runtime.load();
+
+    let span = tracing::info_span!(
+        "embeddings",
+        "gen_ai.system" = tracing::field::Empty,
+        "gen_ai.request.model" = %virtual_model,
+        "gen_ai.response.model" = tracing::field::Empty,
+        "gen_ai.usage.input_tokens" = tracing::field::Empty,
+        "vaultplane.virtual_key.id" = %key.identifier(),
+        "vaultplane.team" = %key.team,
+        "vaultplane.app" = %key.app,
+        "vaultplane.env" = %key.env,
+        "vaultplane.provider.attempts" = tracing::field::Empty,
+        "vaultplane.cost_usd" = tracing::field::Empty,
+        "vaultplane.cache.hit" = tracing::field::Empty,
+        "http.response.status_code" = tracing::field::Empty,
+        "duration_ms" = tracing::field::Empty,
+    );
+
+    if !key.allows_model(&virtual_model) {
+        record_rejection(label_values::REASON_FORBIDDEN_MODEL);
+        span.record("vaultplane.cache.hit", false);
+        span.record("http.response.status_code", 403_u64);
+        span.record("duration_ms", start.elapsed().as_millis() as u64);
+        return error(
+            StatusCode::FORBIDDEN,
+            "virtual key is not allowed to use this model",
+        );
+    }
+
+    if let Some(limit) = &key.spend_limit
+        && !state.spend_tracker.pre_check(&key.identifier(), limit)
+    {
+        record_rejection(label_values::REASON_SPEND_LIMIT);
+        span.record("vaultplane.cache.hit", false);
+        span.record("http.response.status_code", 402_u64);
+        span.record("duration_ms", start.elapsed().as_millis() as u64);
+        return error(
+            StatusCode::PAYMENT_REQUIRED,
+            "spend limit exceeded for this period",
+        );
+    }
+
+    // Plugins run on the embeddings body the same way they run on chat.
+    let body = match run_plugins(&runtime.plugins, body) {
+        Ok(body) => body,
+        Err(info) => {
+            record_rejection(label_values::REASON_PLUGIN);
+            tracing::warn!(
+                reason = %info.reason,
+                status = info.status_code,
+                "request rejected by inline plugin",
+            );
+            span.record("vaultplane.cache.hit", false);
+            span.record("http.response.status_code", u64::from(info.status_code));
+            span.record("duration_ms", start.elapsed().as_millis() as u64);
+            return error(
+                StatusCode::from_u16(info.status_code).unwrap_or(StatusCode::FORBIDDEN),
+                &info.reason,
+            );
+        }
+    };
+
+    // Embeddings are deterministic for the same input, so always cacheable.
+    let cache_key = Some(ResponseCache::key(&key.identifier(), &virtual_model, &body));
+
+    if let (Some(cache), Some(key_str)) = (runtime.cache.as_ref(), cache_key.as_ref())
+        && let Some(cached) = cache.get(key_str).await
+    {
+        return serve_from_cache(&runtime.pricing, &span, &cached, start);
+    }
+
+    let request = EmbeddingsRequest {
+        model: virtual_model,
+        body,
+    };
+
+    let result = runtime.connector.embeddings(request).await;
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(upstream) => {
+            span.record("gen_ai.system", upstream.provider.as_str());
+            span.record("gen_ai.response.model", upstream.model.as_str());
+            span.record("vaultplane.provider.attempts", upstream.attempts as u64);
+            span.record("http.response.status_code", upstream.status as u64);
+            span.record("vaultplane.cache.hit", false);
+            let mut cost_for_metrics: Option<f64> = None;
+            if let Some(usage) = &upstream.usage {
+                span.record("gen_ai.usage.input_tokens", usage.prompt_tokens as u64);
+                if let Some(cost) =
+                    compute_cost(&runtime.pricing, &upstream.provider, &upstream.model, usage)
+                {
+                    span.record("vaultplane.cost_usd", cost);
+                    cost_for_metrics = Some(cost);
+                    if let Some(limit) = &key.spend_limit {
+                        state
+                            .spend_tracker
+                            .record(&key.identifier(), limit.period, cost);
+                    }
+                }
+            }
+            span.record("duration_ms", duration_ms);
+
+            record_completion(
+                &upstream.provider,
+                &upstream.model,
+                upstream.status,
+                label_values::CACHE_MISS,
+                start.elapsed().as_secs_f64(),
+                cost_for_metrics,
+            );
+
+            let cacheable = runtime.cache.is_some() && upstream.status == 200;
+            if cacheable {
+                match collect_body(upstream.body).await {
+                    Ok(bytes) => {
+                        let cached = Arc::new(CachedResponse {
+                            status: upstream.status,
+                            content_type: upstream.content_type.clone(),
+                            body: bytes.clone(),
+                            provider: upstream.provider.clone(),
+                            model: upstream.model.clone(),
+                            usage: upstream.usage,
+                        });
+                        if let (Some(cache), Some(key_str)) = (runtime.cache.as_ref(), cache_key) {
+                            cache.insert(key_str, cached.clone()).await;
+                        }
+                        build_response(
+                            cached.status,
+                            cached.content_type.as_deref(),
+                            Body::from(bytes),
+                            "MISS",
+                        )
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to drain upstream embeddings body");
+                        error(StatusCode::BAD_GATEWAY, "failed to read upstream response")
+                    }
+                }
+            } else {
+                build_response(
+                    upstream.status,
+                    upstream.content_type.as_deref(),
+                    Body::from_stream(upstream.body),
+                    "MISS",
+                )
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "upstream embeddings request failed");
+            span.record("vaultplane.cache.hit", false);
+            span.record("http.response.status_code", 502_u64);
+            span.record("duration_ms", duration_ms);
+            record_rejection(label_values::REASON_UPSTREAM_ERROR);
+            error(StatusCode::BAD_GATEWAY, "upstream request failed")
+        }
+    }
 }
 
 async fn fallback() -> Response {
@@ -530,7 +701,7 @@ fn error(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{compute_cost, router};
-    use axum::body::Body;
+    use axum::body::{self, Body};
     use axum::http::{Method, Request, StatusCode};
     use std::sync::Arc;
     use std::time::Duration;
@@ -719,10 +890,38 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    fn embeddings_request(token: Option<&str>, model: &str) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder
+            .body(Body::from(format!(
+                r#"{{"model":"{model}","input":"hello world"}}"#
+            )))
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn embeddings_is_not_implemented() {
+    async fn embeddings_proxies_to_upstream_when_open() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"object":"list","data":[{"object":"embedding","embedding":[0.1,0.2]}],"usage":{"prompt_tokens":2,"total_tokens":2}}"#,
+                    ),
+            )
+            .mount(&server)
+            .await;
+
         let app = router(
-            connector("http://127.0.0.1:1"),
+            connector(&server.uri()),
             open_keys(),
             open_pricing(),
             no_cache(),
@@ -732,16 +931,80 @@ mod tests {
             no_plugins(),
         );
         let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/v1/embeddings")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(embeddings_request(None, "text-embedding-3-small"))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("\"embedding\""), "body: {text}");
+    }
+
+    #[tokio::test]
+    async fn embeddings_rejects_a_disallowed_model() {
+        let app = router(
+            connector("http://127.0.0.1:1"),
+            store_with_key(&["text-embedding-3-small"]),
+            open_pricing(),
+            no_cache(),
+            no_rate_limit(),
+            no_spend_tracker(),
+            no_models(),
+            no_plugins(),
+        );
+        let response = app
+            .oneshot(embeddings_request(
+                Some("vp_test"),
+                "text-embedding-3-large",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn embeddings_repeated_request_is_served_from_cache() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"object":"list","data":[],"usage":{"prompt_tokens":2,"total_tokens":2}}"#,
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let cache = Arc::new(ResponseCache::new(1024 * 1024, Duration::from_secs(60)));
+        let app = router(
+            connector(&server.uri()),
+            open_keys(),
+            open_pricing(),
+            Some(cache),
+            no_rate_limit(),
+            no_spend_tracker(),
+            no_models(),
+            no_plugins(),
+        );
+
+        let first = app
+            .clone()
+            .oneshot(embeddings_request(None, "text-embedding-3-small"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers().get(super::CACHE_HEADER).unwrap(), "MISS");
+
+        let second = app
+            .oneshot(embeddings_request(None, "text-embedding-3-small"))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(second.headers().get(super::CACHE_HEADER).unwrap(), "HIT");
     }
 
     #[tokio::test]

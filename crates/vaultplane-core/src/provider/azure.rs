@@ -14,7 +14,8 @@ use futures::StreamExt;
 
 use crate::error::{Error, Result};
 use crate::provider::{
-    BodyStream, ChatRequest, ChatResponse, Connector, parse_openai_usage, single_chunk,
+    BodyStream, ChatRequest, ChatResponse, Connector, EmbeddingsRequest, parse_openai_usage,
+    single_chunk,
 };
 
 /// Connector for Azure OpenAI deployments.
@@ -101,6 +102,45 @@ impl Connector for AzureConnector {
             provider: "azure".to_string(),
             model: request.model,
             usage: None,
+            attempts: 1,
+        })
+    }
+
+    async fn embeddings(&self, request: EmbeddingsRequest) -> Result<ChatResponse> {
+        // The route model is the Azure deployment name, which goes in the URL path.
+        let url = format!(
+            "{}/openai/deployments/{}/embeddings?api-version={}",
+            self.base_url, request.model, self.api_version
+        );
+        let response = self
+            .client
+            .post(&url)
+            .header("api-key", &self.api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(request.body)
+            .send()
+            .await
+            .map_err(|e| Error::Provider(format!("request to Azure OpenAI failed: {e}")))?;
+
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+
+        let upstream_body = response
+            .bytes()
+            .await
+            .map_err(|e| Error::Provider(format!("reading Azure OpenAI response failed: {e}")))?;
+        let usage = parse_openai_usage(&upstream_body);
+        Ok(ChatResponse {
+            status,
+            content_type,
+            body: single_chunk(upstream_body.to_vec()),
+            provider: "azure".to_string(),
+            model: request.model,
+            usage,
             attempts: 1,
         })
     }

@@ -14,7 +14,7 @@ use async_trait::async_trait;
 
 use crate::config::ModelConfig;
 use crate::error::{Error, Result};
-use crate::provider::{ChatRequest, ChatResponse, Connector};
+use crate::provider::{ChatRequest, ChatResponse, Connector, EmbeddingsRequest};
 
 /// A single resolved attempt: a connector and the upstream model name to send it.
 struct ResolvedRoute {
@@ -135,6 +135,61 @@ async fn dispatch(resolved: &ResolvedModel, request: ChatRequest) -> Result<Chat
         }
     }
 
+    Err(Error::Provider("no providers were attempted".to_string()))
+}
+
+/// Same shape as [`dispatch`] but for embeddings: tries the model's routes in
+/// order, retrying on the same configured statuses.
+async fn dispatch_embeddings(
+    resolved: &ResolvedModel,
+    request: EmbeddingsRequest,
+) -> Result<ChatResponse> {
+    let last = resolved.routes.len().saturating_sub(1);
+    for (index, route) in resolved.routes.iter().enumerate() {
+        let is_last = index == last;
+        let attempt = EmbeddingsRequest {
+            model: route.model.clone(),
+            body: request.body.clone(),
+        };
+
+        match tokio::time::timeout(resolved.timeout, route.connector.embeddings(attempt)).await {
+            Ok(Ok(mut response)) => {
+                if !is_last && resolved.retry_on.contains(&response.status) {
+                    tracing::warn!(
+                        provider = route.connector.name(),
+                        status = response.status,
+                        "retryable status; failing over to the next provider"
+                    );
+                    continue;
+                }
+                response.attempts = (index + 1) as u32;
+                return Ok(response);
+            }
+            Ok(Err(err)) => {
+                if is_last {
+                    return Err(err);
+                }
+                tracing::warn!(
+                    provider = route.connector.name(),
+                    error = %err,
+                    "provider error; failing over to the next provider"
+                );
+            }
+            Err(_) => {
+                if is_last {
+                    return Err(Error::Provider(
+                        "request timed out on all configured providers".to_string(),
+                    ));
+                }
+                tracing::warn!(
+                    provider = route.connector.name(),
+                    timeout_ms = resolved.timeout.as_millis(),
+                    "provider timed out; failing over to the next provider"
+                );
+            }
+        }
+    }
+
     // Unreachable: the final route always returns above.
     Err(Error::Provider("no providers were attempted".to_string()))
 }
@@ -152,6 +207,20 @@ impl Connector for Registry {
 
         match self.fallback_connector(&request.model) {
             Some(connector) => connector.chat(request).await,
+            None => Err(Error::Provider(format!(
+                "no provider configured for model '{}'",
+                request.model
+            ))),
+        }
+    }
+
+    async fn embeddings(&self, request: EmbeddingsRequest) -> Result<ChatResponse> {
+        if let Some(resolved) = self.models.get(&request.model) {
+            return dispatch_embeddings(resolved, request).await;
+        }
+
+        match self.fallback_connector(&request.model) {
+            Some(connector) => connector.embeddings(request).await,
             None => Err(Error::Provider(format!(
                 "no provider configured for model '{}'",
                 request.model

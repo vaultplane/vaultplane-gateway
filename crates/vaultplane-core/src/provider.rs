@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 pub mod anthropic;
 pub mod azure;
@@ -28,16 +28,21 @@ pub(crate) fn single_chunk(bytes: Vec<u8>) -> BodyStream {
     stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(bytes)) }).boxed()
 }
 
-/// Extract token usage from an OpenAI-shaped Chat Completions response body.
+/// Extract token usage from an OpenAI-shaped response body.
 ///
 /// Returns `None` if the body is not JSON or does not contain a `usage` object with
-/// `prompt_tokens` and `completion_tokens` numbers. Shared by the OpenAI and Azure
-/// connectors, which speak the same response schema.
+/// at least a `prompt_tokens` number. Embeddings responses omit `completion_tokens`,
+/// so it defaults to zero when absent. Shared by the OpenAI and Azure connectors,
+/// which speak the same response schema for both chat and embeddings.
 pub(crate) fn parse_openai_usage(body: &[u8]) -> Option<Usage> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let usage = value.get("usage")?;
     let prompt_tokens = usage.get("prompt_tokens")?.as_u64()? as u32;
-    let completion_tokens = usage.get("completion_tokens")?.as_u64()? as u32;
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(0);
     Some(Usage {
         prompt_tokens,
         completion_tokens,
@@ -51,6 +56,18 @@ pub struct ChatRequest {
     /// Whether the caller asked for a streamed (SSE) response.
     pub stream: bool,
     /// The raw request body, in the OpenAI Chat Completions schema.
+    pub body: Bytes,
+}
+
+/// An embeddings request flowing through the gateway.
+///
+/// Embeddings are never streamed (the OpenAI API has no streaming variant), so
+/// there is no `stream` field. The body is forwarded verbatim to the upstream
+/// after the registry rewrites the `model` field.
+pub struct EmbeddingsRequest {
+    /// The upstream model to send. The registry rewrites this per route.
+    pub model: String,
+    /// The raw request body, in the OpenAI Embeddings schema.
     pub body: Bytes,
 }
 
@@ -83,6 +100,11 @@ pub struct ChatResponse {
 }
 
 /// The contract every provider connector implements.
+///
+/// The [`embeddings`](Connector::embeddings) method defaults to "not supported"
+/// so providers without an embeddings endpoint (Anthropic Messages, AWS
+/// Bedrock today) inherit a clean error without writing a stub. Providers
+/// that do support embeddings (OpenAI, Azure OpenAI) override the default.
 #[async_trait]
 pub trait Connector: Send + Sync {
     /// A stable identifier for the provider family, for example `openai`.
@@ -91,4 +113,13 @@ pub trait Connector: Send + Sync {
     /// Forward a chat completion request to the upstream provider and return its
     /// response as a stream, suitable for both buffered and streamed replies.
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse>;
+
+    /// Forward an embeddings request to the upstream provider. Defaults to a
+    /// "not supported" error for providers that do not offer embeddings.
+    async fn embeddings(&self, _request: EmbeddingsRequest) -> Result<ChatResponse> {
+        Err(Error::Provider(format!(
+            "provider '{}' does not support embeddings",
+            self.name()
+        )))
+    }
 }
