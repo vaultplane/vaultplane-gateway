@@ -142,6 +142,7 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
         runtime.clone(),
         config_path.clone(),
         metrics_handle,
+        tls_config.clone(),
     );
 
     let admin_listener = TcpListener::bind(admin_addr)
@@ -173,7 +174,7 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
 
     // SIGHUP triggers the same reload path the admin API exposes. Unix only;
     // on Windows operators use POST /admin/config/reload.
-    spawn_reload_signal(runtime.clone(), config_path);
+    spawn_reload_signal(runtime.clone(), config_path, tls_config.clone());
 
     let mut proxy_rx = rx.clone();
     let proxy_server = tokio::spawn(async move {
@@ -221,10 +222,14 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Install a SIGHUP handler that re-reads the config file and swaps the runtime
-/// in place. Unix only.
+/// Install a SIGHUP handler that re-reads the config file and swaps the
+/// runtime (and the TLS cert, when TLS is enabled) in place. Unix only.
 #[cfg(unix)]
-fn spawn_reload_signal(runtime: RuntimeHandle, config_path: Option<PathBuf>) {
+fn spawn_reload_signal(
+    runtime: RuntimeHandle,
+    config_path: Option<PathBuf>,
+    rustls: Option<axum_server::tls_rustls::RustlsConfig>,
+) {
     use tokio::signal::unix::{SignalKind, signal};
 
     tokio::spawn(async move {
@@ -233,7 +238,7 @@ fn spawn_reload_signal(runtime: RuntimeHandle, config_path: Option<PathBuf>) {
             return;
         };
         while hup.recv().await.is_some() {
-            match runtime::reload(&runtime, config_path.as_deref()) {
+            match runtime::reload(&runtime, config_path.as_deref(), rustls.as_ref()).await {
                 Ok(()) => tracing::info!("config reloaded via SIGHUP"),
                 Err(err) => tracing::error!(error = %err, "SIGHUP config reload failed"),
             }
@@ -242,7 +247,11 @@ fn spawn_reload_signal(runtime: RuntimeHandle, config_path: Option<PathBuf>) {
 }
 
 #[cfg(not(unix))]
-fn spawn_reload_signal(_runtime: RuntimeHandle, _config_path: Option<PathBuf>) {
+fn spawn_reload_signal(
+    _runtime: RuntimeHandle,
+    _config_path: Option<PathBuf>,
+    _rustls: Option<axum_server::tls_rustls::RustlsConfig>,
+) {
     // SIGHUP is not available on Windows; operators trigger reload via the
     // admin API endpoint instead.
 }

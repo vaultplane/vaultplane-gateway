@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
+use axum_server::tls_rustls::RustlsConfig;
 use vaultplane_core::cache::ResponseCache;
 use vaultplane_core::config::{Config, Pricing};
 use vaultplane_core::plugin::{PiiRedactionPlugin, Plugin, PluginChain};
@@ -55,14 +56,49 @@ pub fn handle(runtime: Runtime) -> RuntimeHandle {
     Arc::new(ArcSwap::from_pointee(runtime))
 }
 
-/// Reload the config from `config_path` and swap it into `handle`.
+/// Reload the config from `config_path` and swap it into `handle`. When a
+/// `rustls` config is provided and the new configuration still has a `tls:`
+/// block, the cert and key are re-read and swapped in place at the same time.
 ///
-/// Validates the new configuration (by parsing and constructing every connector
-/// from scratch) before swapping. On any failure the old runtime stays in
-/// place: in-flight requests are unaffected and the gateway continues to serve.
-pub fn reload(handle: &RuntimeHandle, config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
+/// Validates the new configuration (by parsing and constructing every
+/// connector from scratch) and reloads TLS BEFORE swapping the runtime. On
+/// any failure the old runtime and the old TLS material both stay in place:
+/// in-flight requests are unaffected and the gateway continues to serve.
+///
+/// Two structural changes are NOT applied on reload (they require a restart):
+///
+/// * Adding `tls:` to a gateway started without it. The proxy listener is
+///   bound at startup; adding TLS means rebinding.
+/// * Removing `tls:` from a gateway that was started with it. Same reason.
+///
+/// Both are logged as warnings and the rest of the reload proceeds.
+pub async fn reload(
+    handle: &RuntimeHandle,
+    config_path: Option<&std::path::Path>,
+    rustls: Option<&RustlsConfig>,
+) -> anyhow::Result<()> {
     let config = Config::load(config_path).context("failed to load configuration")?;
     let new_runtime = build_runtime(&config).context("failed to build runtime from new config")?;
+
+    match (rustls, config.listen.tls.as_ref()) {
+        (Some(rustls), Some(tls)) => {
+            crate::tls::reload_certs(rustls, tls).await?;
+        }
+        (None, Some(_)) => {
+            tracing::warn!(
+                "config now sets listen.tls but the gateway started without TLS; \
+                 add or remove TLS requires a restart"
+            );
+        }
+        (Some(_), None) => {
+            tracing::warn!(
+                "config no longer sets listen.tls but the gateway started with TLS; \
+                 the existing cert remains in use until restart"
+            );
+        }
+        (None, None) => {}
+    }
+
     handle.store(Arc::new(new_runtime));
     Ok(())
 }
