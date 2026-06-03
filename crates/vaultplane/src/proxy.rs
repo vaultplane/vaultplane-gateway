@@ -23,6 +23,7 @@ use axum::{
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
+use vaultplane_core::Error as CoreError;
 use vaultplane_core::auth::{KeyStore, RateLimiter, SpendTracker, VirtualKey};
 use vaultplane_core::cache::{CachedResponse, ResponseCache};
 use vaultplane_core::config::Pricing;
@@ -452,11 +453,15 @@ async fn chat_completions(
         }
         Err(err) => {
             tracing::warn!(error = %err, "upstream chat completion failed");
+            let response = upstream_error_response(&err);
             span.record("vaultplane.cache.hit", false);
-            span.record("http.response.status_code", 502_u64);
+            span.record(
+                "http.response.status_code",
+                response.status().as_u16() as u64,
+            );
             span.record("duration_ms", duration_ms);
             record_rejection(label_values::REASON_UPSTREAM_ERROR);
-            error(StatusCode::BAD_GATEWAY, "upstream request failed")
+            response
         }
     }
 }
@@ -680,11 +685,15 @@ async fn embeddings(
         }
         Err(err) => {
             tracing::warn!(error = %err, "upstream embeddings request failed");
+            let response = upstream_error_response(&err);
             span.record("vaultplane.cache.hit", false);
-            span.record("http.response.status_code", 502_u64);
+            span.record(
+                "http.response.status_code",
+                response.status().as_u16() as u64,
+            );
             span.record("duration_ms", duration_ms);
             record_rejection(label_values::REASON_UPSTREAM_ERROR);
-            error(StatusCode::BAD_GATEWAY, "upstream request failed")
+            response
         }
     }
 }
@@ -698,14 +707,36 @@ fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": { "message": message } }))).into_response()
 }
 
+/// Build an OpenAI-shaped error response for a connector failure. Timeouts
+/// become 504 Gateway Timeout; everything else becomes 502 Bad Gateway. The
+/// returned body includes a stable `type` field clients can match on.
+fn upstream_error_response(err: &CoreError) -> Response {
+    let (status, kind, message) = match err {
+        CoreError::UpstreamTimeout(detail) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "upstream_timeout",
+            format!("upstream request timed out: {detail}"),
+        ),
+        other => (StatusCode::BAD_GATEWAY, "upstream_error", other.to_string()),
+    };
+    (
+        status,
+        Json(json!({ "error": { "message": message, "type": kind } })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{compute_cost, router};
+    use async_trait::async_trait;
     use axum::body::{self, Body};
     use axum::http::{Method, Request, StatusCode};
     use std::sync::Arc;
     use std::time::Duration;
     use tower::ServiceExt;
+    use vaultplane_core::Error as CoreError;
+    use vaultplane_core::Result as CoreResult;
     use vaultplane_core::auth::{
         KeyStore, Period, RateLimiter, SpendLimit, SpendTracker, VirtualKey, hash_token,
     };
@@ -715,11 +746,44 @@ mod tests {
     use vaultplane_core::provider::Connector;
     use vaultplane_core::provider::Usage;
     use vaultplane_core::provider::openai::OpenAiConnector;
+    use vaultplane_core::provider::{ChatRequest, ChatResponse, EmbeddingsRequest};
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn connector(base_url: &str) -> Arc<dyn Connector> {
         Arc::new(OpenAiConnector::new(base_url, "test-key").unwrap())
+    }
+
+    /// A connector that always returns the same `Err`, for testing the
+    /// proxy's error-mapping path.
+    struct FailingConnector {
+        make_error: Box<dyn Fn() -> CoreError + Send + Sync>,
+    }
+
+    impl FailingConnector {
+        /// Build an erased `Arc<dyn Connector>` wrapping a closure that
+        /// produces the error to return on every call.
+        fn arc<F>(make_error: F) -> Arc<dyn Connector>
+        where
+            F: Fn() -> CoreError + Send + Sync + 'static,
+        {
+            Arc::new(Self {
+                make_error: Box::new(make_error),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Connector for FailingConnector {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        async fn chat(&self, _request: ChatRequest) -> CoreResult<ChatResponse> {
+            Err((self.make_error)())
+        }
+        async fn embeddings(&self, _request: EmbeddingsRequest) -> CoreResult<ChatResponse> {
+            Err((self.make_error)())
+        }
     }
 
     fn open_keys() -> Arc<KeyStore> {
@@ -903,6 +967,62 @@ mod tests {
                 r#"{{"model":"{model}","input":"hello world"}}"#
             )))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn upstream_timeout_returns_504_with_openai_error_shape() {
+        let app = router(
+            FailingConnector::arc(|| {
+                CoreError::UpstreamTimeout("test upstream timeout".to_string())
+            }),
+            open_keys(),
+            open_pricing(),
+            no_cache(),
+            no_rate_limit(),
+            no_spend_tracker(),
+            no_models(),
+            no_plugins(),
+        );
+        let response = app.oneshot(chat_request(None, "gpt-4o")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let bytes = body::to_bytes(response.into_body(), 8 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["type"], "upstream_timeout");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("timed out"),
+            "expected timeout in message, got {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_provider_error_returns_502_with_message_in_body() {
+        let app = router(
+            FailingConnector::arc(|| {
+                CoreError::Provider("connection refused at 127.0.0.1:1".to_string())
+            }),
+            open_keys(),
+            open_pricing(),
+            no_cache(),
+            no_rate_limit(),
+            no_spend_tracker(),
+            no_models(),
+            no_plugins(),
+        );
+        let response = app.oneshot(chat_request(None, "gpt-4o")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = body::to_bytes(response.into_body(), 8 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["type"], "upstream_error");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("connection refused"),
+            "expected the connector's message in the body, got {message}"
+        );
     }
 
     #[tokio::test]

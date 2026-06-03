@@ -122,9 +122,10 @@ async fn dispatch(resolved: &ResolvedModel, request: ChatRequest) -> Result<Chat
             }
             Err(_) => {
                 if is_last {
-                    return Err(Error::Provider(
-                        "request timed out on all configured providers".to_string(),
-                    ));
+                    return Err(Error::UpstreamTimeout(format!(
+                        "request timed out on all configured providers (last: {})",
+                        route.connector.name()
+                    )));
                 }
                 tracing::warn!(
                     provider = route.connector.name(),
@@ -177,9 +178,10 @@ async fn dispatch_embeddings(
             }
             Err(_) => {
                 if is_last {
-                    return Err(Error::Provider(
-                        "request timed out on all configured providers".to_string(),
-                    ));
+                    return Err(Error::UpstreamTimeout(format!(
+                        "request timed out on all configured providers (last: {})",
+                        route.connector.name()
+                    )));
                 }
                 tracing::warn!(
                     provider = route.connector.name(),

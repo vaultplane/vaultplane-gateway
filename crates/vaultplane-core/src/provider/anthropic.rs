@@ -469,7 +469,11 @@ impl Connector for AnthropicConnector {
             let (encoded, usage) = to_openai_response(&upstream_body)?;
             (encoded, Some(usage))
         } else {
-            (upstream_body.to_vec(), None)
+            // Non-2xx: Anthropic returns its own error envelope
+            // (`{"type":"error","error":{...}}`). Rewrite it into the OpenAI
+            // error shape so clients see a consistent format regardless of the
+            // upstream that handled the request.
+            (to_openai_error(&upstream_body), None)
         };
 
         Ok(ChatResponse {
@@ -482,6 +486,46 @@ impl Connector for AnthropicConnector {
             attempts: 1,
         })
     }
+}
+
+/// Convert an Anthropic error response body into the OpenAI error envelope.
+///
+/// Anthropic returns `{"type":"error","error":{"type":"...","message":"..."}}`;
+/// OpenAI clients expect `{"error":{"message":"...","type":"..."}}`. If the
+/// body is not parseable as the Anthropic shape, the raw body text is wrapped
+/// in a synthetic OpenAI envelope so the client always gets a useful payload.
+fn to_openai_error(body: &[u8]) -> Vec<u8> {
+    let parsed: Option<(String, Option<String>)> =
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| {
+                let error = value.get("error")?;
+                let message = error.get("message")?.as_str()?.to_string();
+                let kind = error
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                Some((message, kind))
+            });
+
+    let (message, kind) = match parsed {
+        Some((m, k)) => (m, k),
+        None => {
+            // Fall back to the raw body text, trimmed to avoid huge payloads.
+            let text = std::str::from_utf8(body).unwrap_or("upstream returned a non-JSON error");
+            let trimmed = if text.len() > 512 { &text[..512] } else { text };
+            (trimmed.to_string(), None)
+        }
+    };
+
+    let envelope = match kind {
+        Some(k) => json!({ "error": { "message": message, "type": k } }),
+        None => json!({ "error": { "message": message } }),
+    };
+    serde_json::to_vec(&envelope).unwrap_or_else(|_| {
+        // Should never happen for a value built from json!() above.
+        br#"{"error":{"message":"upstream returned an error"}}"#.to_vec()
+    })
 }
 
 #[cfg(test)]
@@ -629,6 +673,52 @@ mod tests {
         assert!(
             text.contains("\"completion_tokens\":5"),
             "missing usage chunk completion_tokens: {text}"
+        );
+    }
+
+    /// On a non-2xx response the Anthropic connector rewrites the body into
+    /// the OpenAI error envelope so clients see a consistent shape regardless
+    /// of which upstream actually served the request.
+    #[tokio::test]
+    async fn non_2xx_response_is_rewritten_into_the_openai_error_envelope() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let connector = AnthropicConnector::new(server.uri(), "bad-key").unwrap();
+        let body = json!({
+            "model": "claude-3-7-sonnet",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let response = connector
+            .chat(ChatRequest {
+                model: "claude-3-7-sonnet".to_string(),
+                stream: false,
+                body: Bytes::from(serde_json::to_vec(&body).unwrap()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 401);
+        let bytes = collect(response.body).await;
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["error"]["message"], "invalid x-api-key",
+            "message should come from anthropic body, got: {value}"
+        );
+        assert_eq!(value["error"]["type"], "authentication_error");
+        assert!(
+            value.get("type").is_none(),
+            "OpenAI envelope should not have a top-level 'type' field"
         );
     }
 
