@@ -97,6 +97,7 @@ keeping admin on a tighter perimeter.
 * [Try it in 60 seconds](#try-it-in-60-seconds)
 * [Production quick start](#production-quick-start)
 * [Run with Docker](#run-with-docker)
+* [Examples](#examples)
 * [Configuration](#configuration)
 * [Proxy API](#proxy-api-v1)
 * [Admin API](#admin-api-admin)
@@ -192,6 +193,19 @@ docker run --rm -p 8080:8080 -p 9091:9091 \
 The image is built from `gcr.io/distroless/cc-debian12:nonroot`: no shell,
 no package manager, runs as the non-root user (UID 65532). Linux/amd64
 today; multi-arch (linux/arm64) is a follow-up.
+
+## Examples
+
+Self-contained docker-compose stacks live in [`examples/`](./examples/):
+
+| Example | What it shows |
+| --- | --- |
+| [`quickstart`](./examples/quickstart) | Gateway against OpenAI with caching, `docker compose up` and `curl`. |
+| [`observability`](./examples/observability) | Gateway + Jaeger + Prometheus on one network. Open the Jaeger UI to see one trace per request; open the Prometheus UI to query latency, cost, and rejection metrics. |
+
+Each example has its own README with the run command and the relevant
+PromQL queries. Both run with no virtual keys and no admin token to keep
+the example surface small; production setup is in the rest of this README.
 
 ## Configuration
 

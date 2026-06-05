@@ -1,0 +1,38 @@
+services:
+  gateway:
+    image: ghcr.io/vaultplane/vaultplane-gateway:main
+    container_name: vaultplane-gateway
+    ports:
+      - "8080:8080" # proxy
+      - "9091:9091" # admin (Prometheus scrapes this port)
+    environment:
+      OPENAI_API_KEY: "${OPENAI_API_KEY:?set OPENAI_API_KEY in the environment}"
+      # Send OTLP traces to the Jaeger sidecar below.
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      OTEL_SERVICE_NAME: "vaultplane-gateway"
+    volumes:
+      - ./vaultplane.yaml:/etc/vaultplane/vaultplane.yaml:ro
+    command: ["--config", "/etc/vaultplane/vaultplane.yaml"]
+    depends_on:
+      - jaeger
+
+  jaeger:
+    # Jaeger all-in-one with the OTLP HTTP receiver enabled. Pinned here so
+    # the example does not break on a future major release; bump as needed.
+    image: jaegertracing/all-in-one:1.62
+    container_name: vaultplane-jaeger
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "4318:4318"   # OTLP HTTP receiver (from the gateway)
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: vaultplane-prometheus
+    ports:
+      - "9090:9090" # Prometheus UI
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"

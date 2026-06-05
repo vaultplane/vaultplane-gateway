@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: vaultplane
+    metrics_path: /admin/metrics
+    static_configs:
+      - targets: ["gateway:9091"]
+    # The admin port is open in this example. For production, set
+    # VAULTPLANE_ADMIN_TOKEN on the gateway and add
+    #   authorization:
+    #     type: Bearer
+    #     credentials_file: /etc/vaultplane/admin_token
+    # here, with the file mounted into the Prometheus container.

@@ -1,0 +1,23 @@
+# Minimal config for the quickstart example.
+#
+# No virtual keys defined: the proxy port is open. Convenient on localhost,
+# never deploy like this. See the project README for the production shape.
+
+listen:
+  address: "0.0.0.0:8080"
+  admin_address: "0.0.0.0:9091"
+
+providers:
+  openai:
+    base_url: "https://api.openai.com"
+    api_key_env: "OPENAI_API_KEY"
+
+models:
+  - name: smart
+    primary: { provider: openai, model: gpt-4o }
+    timeout_ms: 30000
+
+cache:
+  enabled: true
+  size_mb: 32
+  ttl_seconds: 300

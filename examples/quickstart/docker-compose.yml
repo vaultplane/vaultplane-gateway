@@ -1,0 +1,12 @@
+services:
+  gateway:
+    image: ghcr.io/vaultplane/vaultplane-gateway:main
+    container_name: vaultplane-gateway
+    ports:
+      - "8080:8080" # proxy
+      - "9091:9091" # admin
+    environment:
+      OPENAI_API_KEY: "${OPENAI_API_KEY:?set OPENAI_API_KEY in the environment}"
+    volumes:
+      - ./vaultplane.yaml:/etc/vaultplane/vaultplane.yaml:ro
+    command: ["--config", "/etc/vaultplane/vaultplane.yaml"]

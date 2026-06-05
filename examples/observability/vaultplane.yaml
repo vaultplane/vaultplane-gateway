@@ -1,0 +1,23 @@
+# Config for the observability example. Same shape as the quickstart with
+# the cache turned on so you can see hit/miss split in metrics; OTLP and
+# Prometheus are wired through the gateway's environment variables and
+# the Prometheus scrape config (see docker-compose.yml and prometheus.yml).
+
+listen:
+  address: "0.0.0.0:8080"
+  admin_address: "0.0.0.0:9091"
+
+providers:
+  openai:
+    base_url: "https://api.openai.com"
+    api_key_env: "OPENAI_API_KEY"
+
+models:
+  - name: smart
+    primary: { provider: openai, model: gpt-4o }
+    timeout_ms: 30000
+
+cache:
+  enabled: true
+  size_mb: 32
+  ttl_seconds: 300
