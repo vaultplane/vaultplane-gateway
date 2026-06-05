@@ -8,8 +8,20 @@ PodDisruptionBudget.
 
 ## Install
 
+From the OCI registry on GHCR (published on each `v*` tag):
+
 ```bash
-# From a local checkout:
+helm install vaultplane oci://ghcr.io/vaultplane/charts/vaultplane \
+  --version 0.0.1 \
+  --create-namespace \
+  --namespace vaultplane \
+  --set "secret.data.OPENAI_API_KEY=sk-..." \
+  --set "secret.data.VAULTPLANE_ADMIN_TOKEN=$(openssl rand -hex 32)"
+```
+
+From a local checkout (useful while developing or pinning to a commit):
+
+```bash
 helm install vaultplane ./charts/vaultplane \
   --create-namespace \
   --namespace vaultplane \

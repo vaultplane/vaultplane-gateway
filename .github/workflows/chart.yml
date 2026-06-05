@@ -1,0 +1,53 @@
+name: Helm chart
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: chart-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: Package and push to GHCR (OCI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint before publishing
+        run: helm lint charts/vaultplane
+
+      - name: Log in to GHCR
+        # `helm registry login` reads the password from stdin so it does
+        # not show up in CI logs.
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            helm registry login ghcr.io \
+              --username "${{ github.actor }}" \
+              --password-stdin
+
+      - name: Package chart
+        run: |
+          mkdir -p dist
+          helm package charts/vaultplane --destination dist
+
+      - name: Push chart to GHCR
+        # Charts land under oci://ghcr.io/<owner>/charts/<chart>:<version>.
+        # The chart name and version both come from Chart.yaml: bump
+        # `version:` in Chart.yaml in the same commit that gets tagged for
+        # each release, otherwise this re-publishes the same version
+        # (GHCR allows the overwrite).
+        run: |
+          for chart in dist/*.tgz; do
+            echo "Pushing $chart"
+            helm push "$chart" "oci://ghcr.io/${{ github.repository_owner }}/charts"
+          done
