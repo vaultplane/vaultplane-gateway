@@ -281,6 +281,7 @@ in `VAULTPLANE_ADMIN_TOKEN`; health and readiness probes are always open.
 | GET | `/admin/keys` | token | List virtual keys (no hashes returned). |
 | POST | `/admin/keys` | token | Issue a new key (returns plaintext token once). |
 | DELETE | `/admin/keys/{id}` | token | Revoke a key and free its rate/spend state. |
+| GET | `/admin/keys/{id}/spend` | token | Current-period spend and remaining budget for a key. |
 | POST | `/admin/config/reload` | token | Reload config and rotate certs in place. |
 
 ## `vaultplane-ctl`

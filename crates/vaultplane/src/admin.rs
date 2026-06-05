@@ -21,7 +21,8 @@ use axum_server::tls_rustls::RustlsConfig;
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::{Deserialize, Serialize};
 use vaultplane_core::auth::{
-    KeyStore, RateLimiter, SpendLimit, SpendTracker, VirtualKey, constant_time_eq, generate_key,
+    KeyStore, Period, RateLimiter, SpendLimit, SpendTracker, VirtualKey, constant_time_eq,
+    generate_key,
 };
 use vaultplane_core::config::Config;
 
@@ -97,6 +98,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/metrics", get(metrics))
         .route("/admin/keys", get(list_keys).post(create_key))
         .route("/admin/keys/{id}", delete(delete_key))
+        .route("/admin/keys/{id}/spend", get(key_spend))
         .route("/admin/config/reload", post(reload_config))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -291,6 +293,72 @@ async fn delete_key(State(state): State<AppState>, Path(id): Path<String>) -> Re
     }
 }
 
+/// In-period spend snapshot for a key with a configured `spend_limit`.
+#[derive(Debug, Serialize)]
+struct SpendSnapshot {
+    usd: f64,
+    period: Period,
+}
+
+/// The active spend budget and remaining headroom for a key.
+#[derive(Debug, Serialize)]
+struct SpendBudget {
+    usd: f64,
+    period: Period,
+    remaining_usd: f64,
+}
+
+/// Response from `GET /admin/keys/{id}/spend`. `spend` and `limit` are both
+/// null when the key has no `spend_limit` set: there is no period to bucket
+/// against, so there is nothing to report. Cumulative-across-all-time spend
+/// is not tracked.
+#[derive(Debug, Serialize)]
+struct KeySpendResponse {
+    key_id: String,
+    team: String,
+    app: String,
+    env: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spend: Option<SpendSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<SpendBudget>,
+}
+
+async fn key_spend(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some(key) = state.keys.find_by_id(&id) else {
+        return (StatusCode::NOT_FOUND, "key not found").into_response();
+    };
+
+    let (spend, limit) = match key.spend_limit {
+        Some(spend_limit) => {
+            let current = state.spend_tracker.current_usd(&key.id, spend_limit.period);
+            let remaining = (spend_limit.amount_usd - current).max(0.0);
+            (
+                Some(SpendSnapshot {
+                    usd: current,
+                    period: spend_limit.period,
+                }),
+                Some(SpendBudget {
+                    usd: spend_limit.amount_usd,
+                    period: spend_limit.period,
+                    remaining_usd: remaining,
+                }),
+            )
+        }
+        None => (None, None),
+    };
+
+    Json(KeySpendResponse {
+        key_id: key.id,
+        team: key.team,
+        app: key.app,
+        env: key.env,
+        spend,
+        limit,
+    })
+    .into_response()
+}
+
 #[derive(Debug, Serialize)]
 struct ReloadResponse {
     status: &'static str,
@@ -466,6 +534,7 @@ mod tests {
             ("GET", "/admin/keys"),
             ("POST", "/admin/keys"),
             ("DELETE", "/admin/keys/vp_unknown"),
+            ("GET", "/admin/keys/vp_unknown/spend"),
             ("GET", "/admin/metrics"),
         ] {
             let response = app
@@ -611,6 +680,145 @@ mod tests {
         assert_eq!(models.len(), 1, "new runtime has one model");
         assert_eq!(models[0].id, "smart");
         assert_eq!(models[0].provider, "openai");
+    }
+
+    #[tokio::test]
+    async fn key_spend_returns_404_when_the_key_is_unknown() {
+        let app = router(state(Some("secret")));
+        let response = app
+            .oneshot(request(
+                "GET",
+                "/admin/keys/vp_does_not_exist/spend",
+                Some("secret"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn key_spend_reports_zero_for_a_key_with_a_limit_and_no_recorded_spend() {
+        let s = state(Some("secret"));
+        // Issue a key with a daily spend limit so the response has limit/spend fields.
+        let generated = vaultplane_core::auth::generate_key();
+        let key = VirtualKey {
+            id: generated.id.clone(),
+            hash: generated.hash.clone(),
+            team: "core".to_string(),
+            app: "web".to_string(),
+            env: "prod".to_string(),
+            models: vec![],
+            rate_limit_rps: None,
+            spend_limit: Some(SpendLimit {
+                amount_usd: 100.0,
+                period: Period::Day,
+            }),
+            expires_at: None,
+        };
+        s.keys.insert(key);
+
+        let app = router(s);
+        let response = app
+            .oneshot(request(
+                "GET",
+                &format!("/admin/keys/{}/spend", generated.id),
+                Some("secret"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["key_id"], generated.id);
+        assert_eq!(body["team"], "core");
+        assert_eq!(body["spend"]["usd"], 0.0);
+        assert_eq!(body["spend"]["period"], "day");
+        assert_eq!(body["limit"]["usd"], 100.0);
+        assert_eq!(body["limit"]["remaining_usd"], 100.0);
+    }
+
+    #[tokio::test]
+    async fn key_spend_reflects_costs_recorded_against_the_tracker() {
+        let s = state(Some("secret"));
+        let generated = vaultplane_core::auth::generate_key();
+        let key = VirtualKey {
+            id: generated.id.clone(),
+            hash: generated.hash.clone(),
+            team: "core".to_string(),
+            app: "web".to_string(),
+            env: "prod".to_string(),
+            models: vec![],
+            rate_limit_rps: None,
+            spend_limit: Some(SpendLimit {
+                amount_usd: 10.0,
+                period: Period::Day,
+            }),
+            expires_at: None,
+        };
+        s.keys.insert(key);
+        s.spend_tracker.record(&generated.id, Period::Day, 3.50);
+
+        let app = router(s);
+        let response = app
+            .oneshot(request(
+                "GET",
+                &format!("/admin/keys/{}/spend", generated.id),
+                Some("secret"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert!(
+            (body["spend"]["usd"].as_f64().unwrap() - 3.5).abs() < 1e-9,
+            "spend.usd should reflect recorded value, got {}",
+            body["spend"]["usd"]
+        );
+        assert!(
+            (body["limit"]["remaining_usd"].as_f64().unwrap() - 6.5).abs() < 1e-9,
+            "remaining = limit - current",
+        );
+    }
+
+    #[tokio::test]
+    async fn key_spend_omits_limit_when_the_key_has_no_spend_limit() {
+        let s = state(Some("secret"));
+        let generated = vaultplane_core::auth::generate_key();
+        let key = VirtualKey {
+            id: generated.id.clone(),
+            hash: generated.hash.clone(),
+            team: "core".to_string(),
+            app: "web".to_string(),
+            env: "dev".to_string(),
+            models: vec![],
+            rate_limit_rps: None,
+            spend_limit: None,
+            expires_at: None,
+        };
+        s.keys.insert(key);
+
+        let app = router(s);
+        let response = app
+            .oneshot(request(
+                "GET",
+                &format!("/admin/keys/{}/spend", generated.id),
+                Some("secret"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert!(
+            body.get("spend").is_none() || body["spend"].is_null(),
+            "no limit means no spend snapshot, got: {body}"
+        );
+        assert!(
+            body.get("limit").is_none() || body["limit"].is_null(),
+            "no limit means no limit field, got: {body}"
+        );
     }
 
     #[tokio::test]

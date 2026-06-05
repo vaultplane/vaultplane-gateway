@@ -216,6 +216,12 @@ impl KeyStore {
         self.read().values().cloned().collect()
     }
 
+    /// Look up a key by its non-secret identifier (the `vp_` id, not the
+    /// token). Returns a clone so the caller does not hold the lock.
+    pub fn find_by_id(&self, id: &str) -> Option<VirtualKey> {
+        self.read().values().find(|k| k.id == id).cloned()
+    }
+
     /// Number of configured keys.
     pub fn len(&self) -> usize {
         self.read().len()
@@ -361,6 +367,21 @@ impl SpendTracker {
             .expect("spend tracker mutex must not be poisoned")
             .remove(key_id);
     }
+
+    /// Cumulative USD spend for `key_id` in the current period for `period`.
+    /// Returns `0.0` when no spend has been recorded for the current period
+    /// (including after a period rollover or for a key that has never spent).
+    pub fn current_usd(&self, key_id: &str, period: Period) -> f64 {
+        let token = current_period_token(period);
+        let entries = self
+            .entries
+            .lock()
+            .expect("spend tracker mutex must not be poisoned");
+        match entries.get(key_id) {
+            Some(state) if state.period_token == token => state.cumulative_usd,
+            _ => 0.0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -392,6 +413,44 @@ mod tests {
         assert!(store.authenticate(token).is_some());
         assert!(store.authenticate("vp_nope").is_none());
         assert!(KeyStore::default().is_empty());
+    }
+
+    #[test]
+    fn key_store_find_by_id_returns_the_matching_record() {
+        let store = KeyStore::default();
+        let generated = generate_key();
+        let mut key = VirtualKey::anonymous();
+        key.id = generated.id.clone();
+        key.hash = generated.hash.clone();
+        key.team = "core".to_string();
+        store.insert(key);
+
+        let found = store.find_by_id(&generated.id).expect("key should exist");
+        assert_eq!(found.id, generated.id);
+        assert_eq!(found.team, "core");
+        assert!(store.find_by_id("vp_nope").is_none());
+    }
+
+    #[test]
+    fn spend_tracker_current_usd_reports_recorded_spend() {
+        let tracker = SpendTracker::default();
+        assert_eq!(
+            tracker.current_usd("k1", Period::Day),
+            0.0,
+            "fresh key reports zero"
+        );
+
+        tracker.record("k1", Period::Day, 1.25);
+        tracker.record("k1", Period::Day, 0.75);
+        assert!(
+            (tracker.current_usd("k1", Period::Day) - 2.0).abs() < 1e-9,
+            "should sum to 2.0"
+        );
+
+        // A different period is its own bucket.
+        assert_eq!(tracker.current_usd("k1", Period::Week), 0.0);
+        // A different key is its own bucket.
+        assert_eq!(tracker.current_usd("k2", Period::Day), 0.0);
     }
 
     #[test]
