@@ -52,16 +52,50 @@ jobs:
             type=sha,prefix=sha-,format=short
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push
+      - name: Build amd64 locally for smoke test
+        # Build a single-arch image into the local Docker daemon (load: true)
+        # so the smoke test can run it. The multi-arch push below reuses the
+        # warm cache, so this does not double the build time.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          load: true
+          platforms: linux/amd64
+          tags: vaultplane:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image
+        # Verify the binary starts (--help exits 0) and that a freshly
+        # booted gateway answers /admin/healthz with 200. Catches missing
+        # runtime libs, broken ENTRYPOINT, and probe-path regressions.
+        run: |
+          set -euo pipefail
+          docker run --rm vaultplane:smoke --help > /dev/null
+          cid=$(docker run -d -p 18080:8080 -p 19091:9091 vaultplane:smoke)
+          trap "docker logs $cid; docker kill $cid >/dev/null" EXIT
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:19091/admin/healthz > /dev/null; then
+              echo "healthz: ok"
+              break
+            fi
+            sleep 0.5
+          done
+          curl -fsS http://localhost:19091/admin/healthz
+          curl -fsS http://localhost:19091/admin/readyz
+
+      - name: Build and push (multi-arch)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           push: true
-          # Multi-arch: native amd64 plus emulated arm64 via QEMU.
+          # Native amd64 plus emulated arm64 via QEMU.
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Reuse Docker layer cache across runs via the GitHub Actions cache.
+          # Same cache as the smoke build so the amd64 half is a hit.
           cache-from: type=gha
           cache-to: type=gha,mode=max
