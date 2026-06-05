@@ -216,7 +216,9 @@ PodDisruptionBudget.
 Configuration is layered: defaults, then an optional YAML file passed with
 `--config`, then environment variables prefixed `VAULTPLANE_` (nested keys
 split on `__`). Validate before reloading with
-`vaultplane-ctl config validate vaultplane.yaml`.
+`vaultplane-ctl config validate vaultplane.yaml`. Every field, type,
+default, and hot-reload status is documented in
+[CONFIGURATION.md](./CONFIGURATION.md).
 
 A representative file:
 
