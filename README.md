@@ -84,6 +84,27 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
 ```
 
+## Run with Docker
+
+Published images live at `ghcr.io/vaultplane/vaultplane-gateway`. Every push
+to `main` produces a new image; tagged releases (`vX.Y.Z`) get semver tags
+plus `latest`.
+
+```bash
+docker pull ghcr.io/vaultplane/vaultplane-gateway:main
+
+docker run --rm -p 8080:8080 -p 9091:9091 \
+  -e OPENAI_API_KEY \
+  -e VAULTPLANE_ADMIN_TOKEN \
+  -v "$(pwd)/vaultplane.yaml:/etc/vaultplane/vaultplane.yaml:ro" \
+  ghcr.io/vaultplane/vaultplane-gateway:main \
+  --config /etc/vaultplane/vaultplane.yaml
+```
+
+The image is built from `gcr.io/distroless/cc-debian12:nonroot`: no shell,
+no package manager, runs as the non-root user (UID 65532). Linux/amd64
+today; multi-arch (linux/arm64) is a follow-up.
+
 ## Configuration
 
 Configuration is layered: defaults, then an optional YAML file passed with

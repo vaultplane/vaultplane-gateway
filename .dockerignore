@@ -1,0 +1,12 @@
+# Keep the build context small. Cargo only needs source files plus the
+# manifests; everything below is either regenerated, repo-only metadata, or
+# unrelated to the binary.
+
+target/
+**/target/
+.git/
+.github/
+.gitignore
+.dockerignore
+Dockerfile
+README.md

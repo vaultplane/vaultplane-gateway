@@ -14,3 +14,10 @@
 .idea/
 .DS_Store
 Thumbs.db
+
+# Defensive: internal planning material that must never end up in this
+# public repo. The canonical copies live outside `gateway/` in the parent
+# workspace; this guards against a stray copy being committed by mistake.
+CLAUDE.md
+.claude/
+docs/
