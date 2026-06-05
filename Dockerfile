@@ -8,8 +8,7 @@
 # outbound provider client) but no shell, package manager, or root user.
 #
 # Built and pushed by `.github/workflows/docker.yml` to
-# `ghcr.io/vaultplane/vaultplane-gateway`. The image is linux/amd64 today;
-# multi-arch (linux/arm64) is a follow-up.
+# `ghcr.io/vaultplane/vaultplane-gateway` for linux/amd64 and linux/arm64.
 
 FROM rust:1.85-slim AS builder
 

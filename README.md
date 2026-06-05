@@ -191,8 +191,8 @@ docker run --rm -p 8080:8080 -p 9091:9091 \
 ```
 
 The image is built from `gcr.io/distroless/cc-debian12:nonroot`: no shell,
-no package manager, runs as the non-root user (UID 65532). Linux/amd64
-today; multi-arch (linux/arm64) is a follow-up.
+no package manager, runs as the non-root user (UID 65532). Published for
+linux/amd64 and linux/arm64.
 
 ## Examples
 

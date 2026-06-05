@@ -21,6 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Set up QEMU
+        # Cross-build linux/arm64 from amd64 runners under emulation.
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -52,8 +58,8 @@ jobs:
           context: .
           file: Dockerfile
           push: true
-          # linux/amd64 only for now; multi-arch is a follow-up.
-          platforms: linux/amd64
+          # Multi-arch: native amd64 plus emulated arm64 via QEMU.
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Reuse Docker layer cache across runs via the GitHub Actions cache.
