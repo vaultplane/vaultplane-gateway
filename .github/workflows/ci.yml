@@ -41,3 +41,36 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  helm:
+    name: helm lint and template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint chart
+        run: helm lint charts/vaultplane
+
+      - name: Render chart with defaults
+        run: helm template release charts/vaultplane > /dev/null
+
+      - name: Render chart with example overrides
+        run: |
+          helm template release charts/vaultplane \
+            --set 'secret.data.OPENAI_API_KEY=sk-test' \
+            --set 'secret.data.VAULTPLANE_ADMIN_TOKEN=test-token' \
+            --set 'serviceMonitor.enabled=true' \
+            --set 'serviceMonitor.bearerTokenSecret.name=release-vaultplane-secrets' \
+            --set 'podDisruptionBudget.enabled=true' \
+            --set 'env.OTEL_EXPORTER_OTLP_ENDPOINT=http://otel:4318' \
+            > /dev/null
+
+      - name: Render chart with external secret
+        run: |
+          helm template release charts/vaultplane \
+            --set 'secret.create=false' \
+            --set 'secret.name=existing-secret' \
+            > /dev/null

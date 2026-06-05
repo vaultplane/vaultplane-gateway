@@ -1,0 +1,20 @@
+apiVersion: v2
+name: vaultplane
+description: |
+  VaultPlane Gateway is an OpenAI-compatible proxy that routes, governs,
+  and observes every AI model call. This chart deploys the data plane
+  with a Deployment, two-port Service, ConfigMap, and Secret.
+type: application
+home: https://github.com/vaultplane/vaultplane-gateway
+sources:
+  - https://github.com/vaultplane/vaultplane-gateway
+keywords:
+  - ai
+  - llm
+  - proxy
+  - openai
+  - anthropic
+  - bedrock
+  - gateway
+version: 0.0.1
+appVersion: "0.0.0"

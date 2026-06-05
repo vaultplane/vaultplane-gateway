@@ -1,0 +1,41 @@
+VaultPlane Gateway is installed.
+
+1. Port-forward the proxy port:
+
+     kubectl --namespace {{ .Release.Namespace }} port-forward \
+       svc/{{ include "vaultplane.fullname" . }} \
+       {{ .Values.service.proxyPort }}:proxy
+
+2. In another shell, call the proxy like OpenAI:
+
+     curl http://localhost:{{ .Values.service.proxyPort }}/v1/chat/completions \
+       -H "Content-Type: application/json" \
+       -d '{"model":"smart","messages":[{"role":"user","content":"hi"}]}'
+
+3. Port-forward the admin port:
+
+     kubectl --namespace {{ .Release.Namespace }} port-forward \
+       svc/{{ include "vaultplane.fullname" . }} \
+       {{ .Values.service.adminPort }}:admin
+
+   Then:
+
+     curl http://localhost:{{ .Values.service.adminPort }}/admin/status
+
+{{- if .Values.secret.create }}
+{{- if not .Values.secret.data }}
+
+WARNING: secret.create=true but secret.data is empty. The gateway will
+have no provider API keys, so every proxy request will fail with an
+upstream error. Set values like OPENAI_API_KEY and (in production)
+VAULTPLANE_ADMIN_TOKEN under `secret.data` and upgrade.
+{{- end }}
+{{- end }}
+
+{{- if not .Values.secret.create }}
+
+This release references an existing Secret: {{ .Values.secret.name }}.
+Make sure it carries the env vars your config expects (the
+api_key_env entries under providers.*, and VAULTPLANE_ADMIN_TOKEN if you
+have configured one).
+{{- end }}

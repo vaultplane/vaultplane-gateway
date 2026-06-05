@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "vaultplane.fullname" . }}
+  labels:
+    {{- include "vaultplane.labels" . | nindent 4 }}
+data:
+  vaultplane.yaml: |
+{{ .Values.config | indent 4 }}

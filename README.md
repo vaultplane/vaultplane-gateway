@@ -207,6 +207,10 @@ Each example has its own README with the run command and the relevant
 PromQL queries. Both run with no virtual keys and no admin token to keep
 the example surface small; production setup is in the rest of this README.
 
+For Kubernetes, a Helm chart lives under [`charts/vaultplane/`](./charts/vaultplane/)
+with two-port Service, ConfigMap, Secret, optional ServiceMonitor, and a
+PodDisruptionBudget.
+
 ## Configuration
 
 Configuration is layered: defaults, then an optional YAML file passed with

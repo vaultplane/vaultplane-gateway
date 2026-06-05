@@ -1,0 +1,135 @@
+# Default values for the vaultplane chart.
+
+image:
+  repository: ghcr.io/vaultplane/vaultplane-gateway
+  # If empty, the chart uses .Chart.AppVersion. Override for a specific
+  # commit / branch tag, for example `main` or `sha-abc1234`.
+  tag: "main"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# One Service with two named ports. The proxy port is what your apps talk
+# to; the admin port is for operators and Prometheus scrapes. Adjust
+# `type` per port if you need a LoadBalancer on one but not the other; the
+# simplest production shape is ClusterIP for both, with an Ingress in
+# front of the proxy.
+service:
+  type: ClusterIP
+  proxyPort: 8080
+  adminPort: 9091
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+# Resource requests and limits are intentionally empty so a `helm install`
+# does not silently constrain the gateway. Set these based on observed
+# load, then promote to your values file.
+resources: {}
+#   requests:
+#     cpu: 100m
+#     memory: 128Mi
+#   limits:
+#     cpu: "1"
+#     memory: 512Mi
+
+# Tight security context: the image is distroless/nonroot, and the
+# container has no need for a writeable root filesystem or any Linux
+# capabilities.
+podSecurityContext:
+  runAsNonRoot: true
+
+containerSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# Probes hit the open admin endpoints.
+livenessProbe:
+  httpGet:
+    path: /admin/healthz
+    port: admin
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /admin/readyz
+    port: admin
+  initialDelaySeconds: 2
+  periodSeconds: 5
+
+# The gateway's YAML config block. Mounted as a ConfigMap and passed via
+# `--config /etc/vaultplane/vaultplane.yaml`. Replace this block with
+# your full configuration (providers, models, plugins, cache, TLS, ...).
+config: |
+  listen:
+    address: "0.0.0.0:8080"
+    admin_address: "0.0.0.0:9091"
+  providers:
+    openai:
+      base_url: "https://api.openai.com"
+      api_key_env: "OPENAI_API_KEY"
+  models:
+    - name: smart
+      primary: { provider: openai, model: gpt-4o }
+      timeout_ms: 30000
+
+# Provider API keys and the admin token come from a Secret. Two modes:
+#
+#   create=true:  the chart manages a Secret named <release>-vaultplane
+#                 (or `secret.name` if set) with whatever keys you put
+#                 under `secret.data`. Good for small setups.
+#
+#   create=false: the chart references an existing Secret you manage out
+#                 of band (ExternalSecrets, Vault, sealed-secrets, etc.).
+#                 Required for production.
+secret:
+  create: true
+  name: ""
+  data: {}
+  # Example shape:
+  #   OPENAI_API_KEY: "sk-..."
+  #   ANTHROPIC_API_KEY: "sk-ant-..."
+  #   VAULTPLANE_ADMIN_TOKEN: "<hex>"
+
+# Extra env vars on the gateway container, beyond what comes from the
+# Secret. Use this for OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME,
+# RUST_LOG, etc.
+env: {}
+#   OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.observability:4318"
+#   OTEL_SERVICE_NAME: "vaultplane-gateway"
+
+# Optional ServiceMonitor for kube-prometheus-stack. Selects the admin
+# port. When the gateway's admin token is set, point
+# `bearerTokenSecret.name` at the Secret that holds it.
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  scrapeTimeout: 10s
+  bearerTokenSecret:
+    name: ""
+    key: VAULTPLANE_ADMIN_TOKEN
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -1,0 +1,10 @@
+# Files included in the chart archive are anything not matched here.
+.DS_Store
+.git/
+.gitignore
+.idea/
+.vscode/
+*.tmproj
+*.swp
+*.bak
+*.tgz
