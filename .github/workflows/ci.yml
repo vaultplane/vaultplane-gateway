@@ -42,6 +42,39 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  coverage:
+    name: code coverage (llvm-cov + codecov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Separate key so the coverage build (instrumented) does not
+          # collide with the release/debug builds in the other jobs.
+          key: coverage
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate coverage report
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          # Codecov needs no token for public repos under their default
+          # config; allow the job to succeed if upload fails so a
+          # codecov outage does not redden every PR.
+          fail_ci_if_error: false
+
   helm:
     name: helm lint and template
     runs-on: ubuntu-latest
