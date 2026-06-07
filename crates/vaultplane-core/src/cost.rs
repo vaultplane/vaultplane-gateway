@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Per-request cost computation from token usage and the pricing table.
 //!
 //! Shared by the proxy's request handler and the streaming usage observer so a

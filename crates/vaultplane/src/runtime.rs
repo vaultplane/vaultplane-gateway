@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Hot-swappable runtime state.
 //!
 //! Everything the request handler reads off the wire is collected into a single

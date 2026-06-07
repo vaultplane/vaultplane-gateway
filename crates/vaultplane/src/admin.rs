@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Admin API: health, readiness, status, and virtual key management.
 //!
 //! The admin API binds to its own port (default 9091) and is intended for

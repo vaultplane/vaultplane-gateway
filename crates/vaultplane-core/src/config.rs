@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Gateway configuration.
 //!
 //! Configuration is layered: defaults, then an optional YAML file, then environment

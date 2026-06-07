@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Minimal AWS Signature Version 4 signing for the Bedrock connector.
 //!
 //! Implements the documented SigV4 algorithm using the vetted `hmac` and `sha2`

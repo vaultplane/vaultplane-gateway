@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Prometheus metrics for the gateway.
 //!
 //! The gateway installs a global `metrics` recorder once at startup; the

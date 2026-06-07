@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! AWS Bedrock provider connector (Anthropic models).
 //!
 //! Bedrock invokes a model by id in the URL path and requires SigV4-signed requests.

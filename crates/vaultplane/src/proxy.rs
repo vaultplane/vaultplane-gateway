@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! OpenAI-compatible proxy API.
 //!
 //! Each request is authenticated (with expiry checked), rate-limited per key,
@@ -1367,7 +1370,7 @@ mod tests {
         });
         let keys = Arc::new(KeyStore::new(vec![key]));
 
-        // Pricing: openai gpt-4o input = $1/1k tokens → one request costs $1.
+        // Pricing: openai gpt-4o input = $1/1k tokens â†’ one request costs $1.
         let mut pricing = Pricing::default();
         let mut openai = std::collections::HashMap::new();
         openai.insert(

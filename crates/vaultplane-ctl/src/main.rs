@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! `vaultplane-ctl`: operator CLI for VaultPlane Gateway.
 //!
 //! Two modes:
@@ -512,7 +515,7 @@ fn config_validate(path: &str) -> anyhow::Result<()> {
 
 /// Print a unified diff between two parsed config files. Both are loaded
 /// through `Config::load` (so env-var overlays and defaults apply equally),
-/// then serialized to pretty JSON before diffing — the line-based diff is
+/// then serialized to pretty JSON before diffing â€” the line-based diff is
 /// readable and avoids pulling in a YAML serializer.
 fn config_diff(old_path: &str, new_path: &str) -> anyhow::Result<()> {
     let old = vaultplane_core::config::Config::load(Some(std::path::Path::new(old_path)))

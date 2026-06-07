@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Azure OpenAI provider connector.
 //!
 //! Azure OpenAI uses the OpenAI Chat Completions schema but a different endpoint

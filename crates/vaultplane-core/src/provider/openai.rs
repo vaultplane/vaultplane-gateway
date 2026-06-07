@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! OpenAI and OpenAI-compatible provider connector.
 //!
 //! Forwards a request to the configured base URL with the provider API key swapped

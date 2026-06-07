@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Tracing and OpenTelemetry setup.
 //!
 //! Installs the standard tracing fmt subscriber, and if

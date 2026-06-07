@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! In-process exact-match response cache.
 //!
 //! A moka LRU stores 200-status chat completion responses keyed by

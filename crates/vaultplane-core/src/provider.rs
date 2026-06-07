@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Provider connector contract.
 //!
 //! Every upstream model provider family (OpenAI and OpenAI-compatible self-hosted,

@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Inbound TLS for the proxy listener.
 //!
 //! When `listen.tls` is set in the configuration, the proxy serves HTTPS via

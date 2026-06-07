@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Configuration-driven model registry with provider failover.
 //!
 //! A virtual model name resolves to a primary provider route plus ordered fallbacks.

@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Inline request inspection plugins.
 //!
 //! The plugin host runs a chain of plugins on each chat request before the gateway

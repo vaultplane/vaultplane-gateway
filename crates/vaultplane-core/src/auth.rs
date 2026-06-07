@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Virtual key authentication, rate limiting, and spend tracking.
 //!
 //! A virtual key is an opaque bearer token (prefixed `vp_`) plus the scope it is

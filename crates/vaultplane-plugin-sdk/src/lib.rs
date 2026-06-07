@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! SDK and WIT contract for VaultPlane Gateway inline plugins.
 //!
 //! Plugins are WebAssembly components that implement the `inspect` interface defined

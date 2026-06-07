@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Streaming usage observer.
 //!
 //! Wraps a [`BodyStream`] of OpenAI Chat Completions SSE chunks, parses the events

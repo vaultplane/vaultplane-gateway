@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! VaultPlane Gateway data plane entry point.
 //!
 //! Loads layered configuration, builds the provider connectors and the virtual

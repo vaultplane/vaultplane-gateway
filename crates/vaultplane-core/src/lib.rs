@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared types and runtime building blocks for the VaultPlane Gateway data plane.
 //!
 //! This crate is the home for the pieces the gateway binary and the `vaultplane-ctl`

@@ -1,3 +1,6 @@
+// Copyright 2026 VaultPlane Contributors
+// SPDX-License-Identifier: Apache-2.0
+
 //! Minimal Server-Sent Events parser, shared by streaming provider connectors.
 //!
 //! Bytes are fed in as they arrive from the upstream; whole events are pulled out
