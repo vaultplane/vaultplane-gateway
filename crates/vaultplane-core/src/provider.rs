@@ -9,12 +9,34 @@
 //! implementation, and the model registry. Responses pass through as byte streams so
 //! the gateway never buffers a full upstream response.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 
 use crate::error::{Error, Result};
+
+/// How long a readiness probe waits for a provider to answer before treating it
+/// as unreachable.
+const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Probe whether an HTTP endpoint is reachable: issue a short-timeout GET and
+/// treat any HTTP response (even a 4xx) as success. Only a transport failure
+/// (DNS, connect, TLS, timeout) counts as unreachable. An empty URL is never
+/// reachable (an unconfigured provider).
+pub(crate) async fn http_reachable(client: &reqwest::Client, url: &str) -> bool {
+    if url.is_empty() {
+        return false;
+    }
+    client
+        .get(url)
+        .timeout(REACHABILITY_TIMEOUT)
+        .send()
+        .await
+        .is_ok()
+}
 
 pub mod anthropic;
 pub mod azure;
@@ -124,5 +146,13 @@ pub trait Connector: Send + Sync {
             "provider '{}' does not support embeddings",
             self.name()
         )))
+    }
+
+    /// Whether the provider is reachable on the network, used to drive
+    /// `/admin/readyz`. This is a connectivity check, not an auth check: a
+    /// provider that answers with 401 is reachable. Defaults to `true` for
+    /// connectors that cannot be cheaply probed.
+    async fn reachable(&self) -> bool {
+        true
     }
 }

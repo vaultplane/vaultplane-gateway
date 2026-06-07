@@ -23,8 +23,11 @@ futures.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 opentelemetry.workspace = true
+opentelemetry-appender-tracing.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -35,7 +38,9 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 rcgen.workspace = true
-reqwest.workspace = true
+# rustls-tls adds client-identity (PEM) support to the test client for the mTLS
+# end-to-end test, on top of the default native-tls backend.
+reqwest = { workspace = true, features = ["rustls-tls"] }
 tempfile.workspace = true
 tower.workspace = true
 wiremock.workspace = true

@@ -18,7 +18,7 @@ use axum::{
     Extension, Json, Router,
     body::{Body, Bytes},
     extract::{Request, State},
-    http::{StatusCode, header::CONTENT_TYPE},
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -27,10 +27,11 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use vaultplane_core::Error as CoreError;
+use vaultplane_core::audit;
 use vaultplane_core::auth::{KeyStore, RateLimiter, SpendTracker, VirtualKey};
 use vaultplane_core::cache::{CachedResponse, ResponseCache};
 use vaultplane_core::config::Pricing;
-use vaultplane_core::plugin::{Decision, Plugin, PluginRequest, RejectInfo};
+use vaultplane_core::plugin::{Decision, PluginEntry, PluginRequest, RejectInfo};
 use vaultplane_core::provider::{BodyStream, ChatRequest, EmbeddingsRequest, Usage};
 use vaultplane_core::stream_observer::UsageObservingStream;
 
@@ -47,6 +48,28 @@ use vaultplane_core::plugin::PluginChain;
 use vaultplane_core::provider::Connector;
 
 const CACHE_HEADER: &str = "x-vaultplane-cache";
+/// Caller-provided trace id, recorded on the request span when present.
+const TRACE_ID_HEADER: &str = "x-vaultplane-trace-id";
+/// Caller-provided idempotency key; when present it keys the cache instead of
+/// the request body, so retries with the same key share a cached response.
+const IDEMPOTENCY_HEADER: &str = "x-vaultplane-idempotency-key";
+
+/// Compute the cache key for a request, preferring a caller-supplied idempotency
+/// key over a hash of the body.
+fn cache_key_for(scope: &str, model: &str, idempotency_key: Option<&str>, body: &Bytes) -> String {
+    match idempotency_key {
+        Some(k) => ResponseCache::key(scope, model, format!("idempotency:{k}").as_bytes()),
+        None => ResponseCache::key(scope, model, body),
+    }
+}
+
+/// Read a non-empty header value as a string slice.
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|s| !s.is_empty())
+}
 
 /// Increment the rejection counter with the given reason.
 fn record_rejection(reason: &'static str) {
@@ -244,34 +267,58 @@ async fn collect_body(mut body: BodyStream) -> std::io::Result<Bytes> {
     Ok(Bytes::from(buf))
 }
 
-/// Run the inline plugin chain on the request body. Each plugin sees the body
-/// produced by the previous one; on Reject the chain shortcircuits.
-fn run_plugins(plugins: &[Box<dyn Plugin>], body: Bytes) -> Result<Bytes, RejectInfo> {
+/// Run the inline plugin chain on the request body. Plugins bound to specific
+/// routes are skipped for other virtual models. Each plugin that runs sees the
+/// body produced by the previous one; on Reject the chain shortcircuits.
+fn run_plugins(
+    plugins: &[PluginEntry],
+    path: &str,
+    virtual_model: &str,
+    body: Bytes,
+) -> Result<Bytes, PluginRejection> {
     let mut current = body;
-    for plugin in plugins {
+    for entry in plugins {
+        if !entry.applies_to(virtual_model) {
+            continue;
+        }
         let request = PluginRequest {
             method: "POST".to_string(),
-            path: "/v1/chat/completions".to_string(),
+            path: path.to_string(),
             headers: Vec::new(),
             body: current.clone(),
         };
-        match plugin.inspect_request(&request) {
+        match entry.plugin.inspect_request(&request) {
             Decision::Pass => {}
             Decision::Modify(updated) => current = updated.body,
-            Decision::Reject(info) => return Err(info),
+            Decision::Reject(info) => {
+                return Err(PluginRejection {
+                    plugin: entry.plugin.name().to_string(),
+                    info,
+                });
+            }
         }
     }
     Ok(current)
 }
 
+/// A plugin's rejection, carrying which plugin rejected the request so the call
+/// site can audit it.
+struct PluginRejection {
+    plugin: String,
+    info: RejectInfo,
+}
+
 async fn chat_completions(
     State(state): State<ProxyState>,
     Extension(key): Extension<VirtualKey>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let start = Instant::now();
     let meta: ChatMeta = serde_json::from_slice(&body).unwrap_or_default();
     let virtual_model = meta.model.unwrap_or_default();
+    let caller_trace_id = header_str(&headers, TRACE_ID_HEADER);
+    let idempotency_key = header_str(&headers, IDEMPOTENCY_HEADER);
 
     // Snapshot the current runtime once; a config reload swaps the handle but
     // this request keeps the bundle it loaded here for the rest of its life.
@@ -288,12 +335,16 @@ async fn chat_completions(
         "vaultplane.team" = %key.team,
         "vaultplane.app" = %key.app,
         "vaultplane.env" = %key.env,
+        "vaultplane.trace_id" = tracing::field::Empty,
         "vaultplane.provider.attempts" = tracing::field::Empty,
         "vaultplane.cost_usd" = tracing::field::Empty,
         "vaultplane.cache.hit" = tracing::field::Empty,
         "http.response.status_code" = tracing::field::Empty,
         "duration_ms" = tracing::field::Empty,
     );
+    if let Some(trace_id) = caller_trace_id {
+        span.record("vaultplane.trace_id", trace_id);
+    }
 
     if !key.allows_model(&virtual_model) {
         record_rejection(label_values::REASON_FORBIDDEN_MODEL);
@@ -324,11 +375,24 @@ async fn chat_completions(
     // Run inline plugins (e.g. PII redaction) before the cache and the upstream
     // dispatch. A Modify decision replaces the body for the rest of the request;
     // a Reject decision shortcircuits with the plugin's status and reason.
-    let body = match run_plugins(&runtime.plugins, body) {
+    let body = match run_plugins(
+        &runtime.plugins,
+        "/v1/chat/completions",
+        &virtual_model,
+        body,
+    ) {
         Ok(body) => body,
-        Err(info) => {
+        Err(rejection) => {
+            let info = rejection.info;
             record_rejection(label_values::REASON_PLUGIN);
+            audit::plugin_rejected(
+                &key.identifier(),
+                &rejection.plugin,
+                &info.reason,
+                info.status_code,
+            );
             tracing::warn!(
+                plugin = %rejection.plugin,
                 reason = %info.reason,
                 status = info.status_code,
                 "request rejected by inline plugin",
@@ -344,8 +408,8 @@ async fn chat_completions(
     };
 
     // Compute the cache key for cacheable (non-streaming) requests.
-    let cache_key =
-        (!meta.stream).then(|| ResponseCache::key(&key.identifier(), &virtual_model, &body));
+    let cache_key = (!meta.stream)
+        .then(|| cache_key_for(&key.identifier(), &virtual_model, idempotency_key, &body));
 
     // Cache lookup. Cache hits do not count against the spend budget (no upstream
     // spend incurred); their cost on the span is informational.
@@ -531,11 +595,14 @@ struct EmbeddingsMeta {
 async fn embeddings(
     State(state): State<ProxyState>,
     Extension(key): Extension<VirtualKey>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let start = Instant::now();
     let meta: EmbeddingsMeta = serde_json::from_slice(&body).unwrap_or_default();
     let virtual_model = meta.model.unwrap_or_default();
+    let caller_trace_id = header_str(&headers, TRACE_ID_HEADER);
+    let idempotency_key = header_str(&headers, IDEMPOTENCY_HEADER);
 
     let runtime = state.runtime.load();
 
@@ -549,12 +616,16 @@ async fn embeddings(
         "vaultplane.team" = %key.team,
         "vaultplane.app" = %key.app,
         "vaultplane.env" = %key.env,
+        "vaultplane.trace_id" = tracing::field::Empty,
         "vaultplane.provider.attempts" = tracing::field::Empty,
         "vaultplane.cost_usd" = tracing::field::Empty,
         "vaultplane.cache.hit" = tracing::field::Empty,
         "http.response.status_code" = tracing::field::Empty,
         "duration_ms" = tracing::field::Empty,
     );
+    if let Some(trace_id) = caller_trace_id {
+        span.record("vaultplane.trace_id", trace_id);
+    }
 
     if !key.allows_model(&virtual_model) {
         record_rejection(label_values::REASON_FORBIDDEN_MODEL);
@@ -581,11 +652,19 @@ async fn embeddings(
     }
 
     // Plugins run on the embeddings body the same way they run on chat.
-    let body = match run_plugins(&runtime.plugins, body) {
+    let body = match run_plugins(&runtime.plugins, "/v1/embeddings", &virtual_model, body) {
         Ok(body) => body,
-        Err(info) => {
+        Err(rejection) => {
+            let info = rejection.info;
             record_rejection(label_values::REASON_PLUGIN);
+            audit::plugin_rejected(
+                &key.identifier(),
+                &rejection.plugin,
+                &info.reason,
+                info.status_code,
+            );
             tracing::warn!(
+                plugin = %rejection.plugin,
                 reason = %info.reason,
                 status = info.status_code,
                 "request rejected by inline plugin",
@@ -601,7 +680,12 @@ async fn embeddings(
     };
 
     // Embeddings are deterministic for the same input, so always cacheable.
-    let cache_key = Some(ResponseCache::key(&key.identifier(), &virtual_model, &body));
+    let cache_key = Some(cache_key_for(
+        &key.identifier(),
+        &virtual_model,
+        idempotency_key,
+        &body,
+    ));
 
     if let (Some(cache), Some(key_str)) = (runtime.cache.as_ref(), cache_key.as_ref())
         && let Some(cached) = cache.get(key_str).await
@@ -731,7 +815,7 @@ fn upstream_error_response(err: &CoreError) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_cost, router};
+    use super::{cache_key_for, compute_cost, router};
     use async_trait::async_trait;
     use axum::body::{self, Body};
     use axum::http::{Method, Request, StatusCode};
@@ -745,7 +829,7 @@ mod tests {
     };
     use vaultplane_core::cache::ResponseCache;
     use vaultplane_core::config::{ModelPricing, Pricing};
-    use vaultplane_core::plugin::{PiiRedactionPlugin, Plugin, PluginChain};
+    use vaultplane_core::plugin::{PiiRedactionPlugin, Plugin, PluginChain, PluginEntry};
     use vaultplane_core::provider::Connector;
     use vaultplane_core::provider::Usage;
     use vaultplane_core::provider::openai::OpenAiConnector;
@@ -837,6 +921,51 @@ mod tests {
         builder
             .body(Body::from(format!(r#"{{"model":"{model}"}}"#)))
             .unwrap()
+    }
+
+    #[test]
+    fn idempotency_key_overrides_body_for_cache_key() {
+        let a = cache_key_for(
+            "vp_1",
+            "gpt-4o",
+            Some("abc"),
+            &body::Bytes::from_static(b"{\"x\":1}"),
+        );
+        let b = cache_key_for(
+            "vp_1",
+            "gpt-4o",
+            Some("abc"),
+            &body::Bytes::from_static(b"{\"x\":2}"),
+        );
+        assert_eq!(
+            a, b,
+            "same idempotency key should key the cache regardless of body"
+        );
+
+        let c = cache_key_for(
+            "vp_1",
+            "gpt-4o",
+            Some("other"),
+            &body::Bytes::from_static(b"{\"x\":1}"),
+        );
+        assert_ne!(a, c, "different idempotency keys must differ");
+
+        let by_body_1 = cache_key_for(
+            "vp_1",
+            "gpt-4o",
+            None,
+            &body::Bytes::from_static(b"{\"x\":1}"),
+        );
+        let by_body_2 = cache_key_for(
+            "vp_1",
+            "gpt-4o",
+            None,
+            &body::Bytes::from_static(b"{\"x\":2}"),
+        );
+        assert_ne!(
+            by_body_1, by_body_2,
+            "without an idempotency key the body drives the cache key"
+        );
     }
 
     #[test]
@@ -1497,9 +1626,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let plugins: PluginChain = Arc::new(vec![
-            Box::new(PiiRedactionPlugin::default()) as Box<dyn Plugin>
-        ]);
+        let plugins: PluginChain = Arc::new(vec![PluginEntry {
+            plugin: Box::new(PiiRedactionPlugin::default()) as Box<dyn Plugin>,
+            bind_routes: Vec::new(),
+        }]);
         let app = router(
             connector(&server.uri()),
             open_keys(),
@@ -1521,5 +1651,88 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// End-to-end latency harness: drives the full inbound path (auth, plugin
+    /// chain, cache-key derivation, dispatch, cost accounting) against a
+    /// near-zero-latency local upstream and reports P50/P99, the figures the N1
+    /// budget targets (P50 < 5ms, P99 < 15ms of gateway overhead).
+    ///
+    /// Ignored by default: it is timing-sensitive and runs a few seconds. Invoke
+    /// explicitly with
+    /// `cargo test -p vaultplane --bin vaultplane -- --ignored latency`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "latency harness; run explicitly with --ignored"]
+    async fn latency_overhead_p50_p99() {
+        use std::time::Instant;
+
+        // A local upstream simulator that answers chat completions immediately.
+        const UPSTREAM_BODY: &str = r#"{"id":"chatcmpl-bench","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+        let upstream = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    UPSTREAM_BODY,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let app = router(
+            connector(&format!("http://{addr}")),
+            store_with_key(&["bench-model"]),
+            open_pricing(),
+            no_cache(),
+            no_rate_limit(),
+            no_spend_tracker(),
+            no_models(),
+            no_plugins(),
+        );
+
+        let warmup = 200;
+        let samples = 3000;
+
+        // Warm up the connection pool and any one-time allocations.
+        for _ in 0..warmup {
+            let resp = app
+                .clone()
+                .oneshot(chat_request(Some("vp_test"), "bench-model"))
+                .await
+                .unwrap();
+            let _ = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        }
+
+        let mut durations = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let req = chat_request(Some("vp_test"), "bench-model");
+            let start = Instant::now();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            // Drain the streamed body so the full round trip is measured.
+            let _ = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            durations.push(start.elapsed());
+        }
+
+        durations.sort_unstable();
+        let pct = |p: usize| durations[(durations.len() * p / 100).min(durations.len() - 1)];
+        let (p50, p99, min, max) = (pct(50), pct(99), durations[0], *durations.last().unwrap());
+        println!(
+            "latency over {samples} requests (includes localhost upstream): \
+             min={min:?} p50={p50:?} p99={p99:?} max={max:?}"
+        );
+
+        // A generous regression tripwire rather than a strict N1 gate: the
+        // figure includes the local upstream round trip and CI runners are
+        // noisy. It still catches a gross regression (for example a per-request
+        // full-body buffering or an accidental blocking call).
+        assert!(
+            p99 < Duration::from_millis(100),
+            "P99 latency regressed badly: p99={p99:?} (p50={p50:?})"
+        );
     }
 }

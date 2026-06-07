@@ -7,8 +7,75 @@ from `v1.0.0` onward; pre-1.0 minor bumps may include breaking changes.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-07
+
 ### Added
 
+* `control_plane.mode` (`file` | `api`) selects the configuration source. The
+  Cloud `api` path is a stub in this release: the gateway logs and serves from
+  last-known-good local configuration, so the data plane keeps running whether or
+  not a control plane is reachable.
+* A default pricing table is bundled with the binary (common OpenAI, Anthropic,
+  Azure, and Bedrock models), so cost is reported out of the box; `pricing`
+  config entries override or extend it.
+* Optional request headers: `X-VaultPlane-Trace-Id` is recorded on the request
+  span, and `X-VaultPlane-Idempotency-Key` keys the cache instead of the request
+  body.
+* `shutdown.drain_timeout_seconds` (default 30) makes the graceful-drain window
+  on SIGTERM configurable, with a hard cap that forces exit if draining overruns.
+* Wasm plugins can be loaded from `http(s)://` and `file://` URLs, not just local
+  paths; remote components are downloaded at load time.
+* WebAssembly plugin host (wasmtime, Component Model). Loads components
+  implementing the `inspect-request` WIT contract, runs them in a WASI
+  sandbox with a fresh store per call, enforces each plugin's latency
+  budget with an epoch-deadline trap, and fails open or closed per route
+  policy on overrun, trap, or load failure. Configured via the `wasm`
+  plugin type, with `latency_budget_ms`, `on_timeout`, and `bind_routes`.
+* The reference PII-redaction plugin now ships as a real WebAssembly
+  component (built for `wasm32-wasip2`), redacting SSN, US credit card, US
+  phone, and email patterns in chat request bodies.
+* Plugins can be bound to specific virtual models via `bind_routes`;
+  unbound plugins run on every request.
+* Structured audit log. Administrative actions and policy decisions
+  (`key.create`, `key.revoke`, `config.reload`, `plugin.load`,
+  `plugin.reject`, `failover`) are emitted on the `vaultplane::audit` tracing
+  target, tagged `vaultplane.audit=true` with canonical `action`, `actor`,
+  `subject`, and `outcome` fields plus action-specific metadata.
+* OTLP logs export. When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, every tracing
+  event (including the audit stream) is exported as OTLP logs to `/v1/logs`,
+  alongside the existing span export to `/v1/traces`.
+* Optional mutual TLS on the proxy listener via `listen.tls.client_ca_path`.
+  When set, clients must present a certificate chaining to the configured CA
+  bundle or the connection is refused at the handshake. Toggling mTLS on or off
+  is hot-reloadable within an existing `tls:` block.
+* `GET /admin/models` lists the configured virtual models and their providers,
+  and `vaultplane-ctl model list` is now implemented against it.
+* Criterion microbenchmarks for the per-request hot path (virtual-key auth and
+  token hashing, cache-key derivation, cost accounting), run as a compile check
+  in CI.
+* End-to-end latency harness that drives the full inbound path against a local
+  upstream simulator and reports P50/P99 gateway overhead (the N1 budget). It is
+  `#[ignore]`d in the normal test run and executed explicitly in CI.
+* Integrations under `integrations/`: OpenTelemetry Collector presets that take
+  the gateway's OTLP traces/logs and scraped Prometheus metrics to Dynatrace,
+  Datadog, Splunk Observability, New Relic, Grafana Cloud, Elastic, and
+  Honeycomb. The Dynatrace launch partner ships a starter dashboard and a
+  ten-minute setup guide; the Rubrik Agent Rewind feed (audit stream plus
+  request spans) ships as a stub pending Rubrik's finalized ingest schema.
+* Release workflow: on a `v*` tag, a guard verifies the tag matches the crate
+  version, then static binaries (Linux amd64/arm64 via musl, macOS arm64) each
+  bundling `vaultplane` and `vaultplane-ctl`, plus the reference PII plugin
+  `.wasm`, are built, checksummed, and attached to a GitHub Release with notes
+  drawn from this changelog. The Docker image and Helm chart continue to publish
+  from their own tag-triggered workflows.
+
+### Changed
+
+* `/admin/readyz` now reflects provider reachability. A background prober
+  marks the gateway ready once at least one configured provider answers a
+  lightweight connectivity check, and not-ready (503) if they all become
+  unreachable, so orchestrators pull the pod from rotation. With no models
+  configured, readiness is not blocked.
 * `SECURITY.md`, `CONTRIBUTING.md`, and `CHANGELOG.md` (this file) for
   pre-1.0 project hygiene.
 

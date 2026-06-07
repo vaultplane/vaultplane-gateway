@@ -1,0 +1,60 @@
+# OpenTelemetry Collector preset: VaultPlane Gateway to Dynatrace.
+#
+# Receives OTLP (traces + logs) from the gateway and scrapes its Prometheus
+# metrics, then forwards all three signals to Dynatrace over OTLP.
+#
+# Required environment variables:
+#   VAULTPLANE_ADMIN_TOKEN  bearer token for scraping the gateway admin port
+#   DT_ENDPOINT             your environment URL, e.g. https://abc12345.live.dynatrace.com
+#   DT_API_TOKEN            a Dynatrace API token with the OTLP ingest scopes
+#                           (metrics.ingest, logs.ingest, openTelemetryTrace.ingest)
+#
+# Point the gateway at this Collector with:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector-host>:4318
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: vaultplane-gateway
+          scrape_interval: 15s
+          metrics_path: /admin/metrics
+          authorization:
+            type: Bearer
+            credentials: ${env:VAULTPLANE_ADMIN_TOKEN}
+          static_configs:
+            - targets: ["vaultplane-gateway:9091"]
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  batch: {}
+
+exporters:
+  otlphttp/dynatrace:
+    endpoint: ${env:DT_ENDPOINT}/api/v2/otlp
+    headers:
+      Authorization: "Api-Token ${env:DT_API_TOKEN}"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/dynatrace]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/dynatrace]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/dynatrace]

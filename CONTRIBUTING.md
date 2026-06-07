@@ -31,6 +31,19 @@ cargo clippy --all-targets -- -D warnings
 
 CI runs all four; anything red there will block the PR.
 
+Performance work has two extra tools, both run by CI as well:
+
+```bash
+# Criterion microbenchmarks for the per-request hot path
+# (auth, cache-key derivation, cost accounting).
+cargo bench -p vaultplane-core
+
+# End-to-end latency harness: drives the full inbound path against a
+# local upstream simulator and prints P50/P99 gateway overhead. It is
+# #[ignore]d in the normal run, so invoke it explicitly.
+cargo test -p vaultplane --bin vaultplane -- --ignored latency
+```
+
 ## What we look for in a PR
 
 * **Tests for behavior changes.** Every existing slice landed with
@@ -131,5 +144,12 @@ you have a strong reason not to:
 
 By contributing, you agree that your contributions will be licensed
 under the [Apache License 2.0](./LICENSE), the same terms as the
-rest of the project. A formal Contributor License Agreement is
-planned but not yet required.
+rest of the project.
+
+Outside contributions also require a signed Contributor License
+Agreement (CLA). When you open your first pull request, the CLA
+assistant comments with a link; sign it once and it covers your
+future contributions. A PR cannot be merged until the CLA check is
+green. Contributions from VaultPlane employees made in the course of
+their work are covered by their employment agreement and do not need
+a separate signature.

@@ -1,0 +1,68 @@
+# OpenTelemetry Collector preset: VaultPlane Gateway to Grafana Cloud.
+#
+# Grafana Cloud exposes a single OTLP gateway endpoint authenticated with HTTP
+# basic auth (instance ID as username, an API token as password). Requires the
+# basicauth extension (present in the Contrib distribution).
+#
+# Required environment variables:
+#   VAULTPLANE_ADMIN_TOKEN        bearer token for scraping the gateway admin port
+#   GRAFANA_CLOUD_OTLP_ENDPOINT   e.g. https://otlp-gateway-prod-us-central-0.grafana.net/otlp
+#   GRAFANA_CLOUD_INSTANCE_ID     numeric stack/instance ID
+#   GRAFANA_CLOUD_API_TOKEN       API token with metrics/traces/logs push scope
+#
+# Point the gateway at this Collector with:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector-host>:4318
+
+extensions:
+  basicauth/grafana:
+    client_auth:
+      username: ${env:GRAFANA_CLOUD_INSTANCE_ID}
+      password: ${env:GRAFANA_CLOUD_API_TOKEN}
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: vaultplane-gateway
+          scrape_interval: 15s
+          metrics_path: /admin/metrics
+          authorization:
+            type: Bearer
+            credentials: ${env:VAULTPLANE_ADMIN_TOKEN}
+          static_configs:
+            - targets: ["vaultplane-gateway:9091"]
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  batch: {}
+
+exporters:
+  otlphttp/grafana:
+    endpoint: ${env:GRAFANA_CLOUD_OTLP_ENDPOINT}
+    auth:
+      authenticator: basicauth/grafana
+
+service:
+  extensions: [basicauth/grafana]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/grafana]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/grafana]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/grafana]

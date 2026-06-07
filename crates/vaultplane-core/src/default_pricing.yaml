@@ -1,0 +1,49 @@
+# Default pricing table shipped with VaultPlane Gateway.
+#
+# Prices are USD per 1,000 tokens and are approximate list prices; they drift, so
+# treat them as sane defaults rather than billing truth. Override or extend any
+# entry per deployment with the `pricing` block in the gateway config (config
+# entries win over these). Embeddings models price input only.
+#
+# Update by PR.
+providers:
+  openai:
+    gpt-4o:
+      input_per_1k_tokens_usd: 0.0025
+      output_per_1k_tokens_usd: 0.01
+    gpt-4o-mini:
+      input_per_1k_tokens_usd: 0.00015
+      output_per_1k_tokens_usd: 0.0006
+    gpt-4-turbo:
+      input_per_1k_tokens_usd: 0.01
+      output_per_1k_tokens_usd: 0.03
+    text-embedding-3-small:
+      input_per_1k_tokens_usd: 0.00002
+      output_per_1k_tokens_usd: 0.0
+    text-embedding-3-large:
+      input_per_1k_tokens_usd: 0.00013
+      output_per_1k_tokens_usd: 0.0
+  azure:
+    gpt-4o:
+      input_per_1k_tokens_usd: 0.0025
+      output_per_1k_tokens_usd: 0.01
+    gpt-4o-mini:
+      input_per_1k_tokens_usd: 0.00015
+      output_per_1k_tokens_usd: 0.0006
+  anthropic:
+    claude-3-7-sonnet:
+      input_per_1k_tokens_usd: 0.003
+      output_per_1k_tokens_usd: 0.015
+    claude-3-5-haiku:
+      input_per_1k_tokens_usd: 0.0008
+      output_per_1k_tokens_usd: 0.004
+    claude-3-opus:
+      input_per_1k_tokens_usd: 0.015
+      output_per_1k_tokens_usd: 0.075
+  bedrock:
+    claude-3-7-sonnet:
+      input_per_1k_tokens_usd: 0.003
+      output_per_1k_tokens_usd: 0.015
+    claude-3-5-haiku:
+      input_per_1k_tokens_usd: 0.0008
+      output_per_1k_tokens_usd: 0.004

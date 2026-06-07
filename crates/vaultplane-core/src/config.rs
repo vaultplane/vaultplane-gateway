@@ -39,6 +39,72 @@ pub struct Config {
     pub cache: CacheConfig,
     /// Inline request-inspection plugins, applied in order.
     pub plugins: Vec<PluginConfig>,
+    /// Where configuration comes from: a local file (open source) or the Cloud
+    /// control plane API.
+    pub control_plane: ControlPlane,
+    /// Graceful shutdown behavior.
+    pub shutdown: Shutdown,
+}
+
+/// Configuration source selection.
+///
+/// The same binary serves both the open-source file-based path and the Cloud
+/// control-plane API path; `mode` picks between them. The Cloud client is a stub
+/// in this release: in `api` mode the gateway logs that the control plane is not
+/// yet wired and serves from the last-known-good local configuration, so the
+/// data plane keeps running whether or not a control plane is reachable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ControlPlane {
+    /// Configuration source: `file` (default) or `api`.
+    pub mode: ControlPlaneMode,
+    /// Directory the file-based path reads configuration from.
+    pub config_dir: String,
+    /// Cloud control plane endpoint (used when `mode` is `api`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Environment variable holding the control plane token (used when `mode` is `api`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
+}
+
+impl Default for ControlPlane {
+    fn default() -> Self {
+        Self {
+            mode: ControlPlaneMode::File,
+            config_dir: "/etc/vaultplane".to_string(),
+            endpoint: None,
+            token_env: None,
+        }
+    }
+}
+
+/// The configuration source the gateway runs against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ControlPlaneMode {
+    /// Read configuration from local files.
+    #[default]
+    File,
+    /// Pull configuration from the Cloud control plane API (stubbed in this release).
+    Api,
+}
+
+/// Graceful shutdown behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Shutdown {
+    /// How long, in seconds, to let in-flight requests finish on SIGTERM before
+    /// the listeners are forced closed.
+    pub drain_timeout_seconds: u64,
+}
+
+impl Default for Shutdown {
+    fn default() -> Self {
+        Self {
+            drain_timeout_seconds: 30,
+        }
+    }
 }
 
 /// Listener addresses.
@@ -74,6 +140,11 @@ pub struct TlsConfig {
     pub cert_path: String,
     /// Path to the PEM-encoded private key for the certificate.
     pub key_path: String,
+    /// Optional path to a PEM-encoded CA bundle. When set, the proxy listener
+    /// requires mutual TLS: clients must present a certificate that chains to
+    /// one of these CAs, or the connection is refused at the handshake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ca_path: Option<String>,
 }
 
 /// Upstream provider configuration. One provider family for now.
@@ -240,6 +311,32 @@ pub struct Pricing {
     pub providers: HashMap<String, HashMap<String, ModelPricing>>,
 }
 
+/// The default pricing table shipped with the binary. Approximate list prices;
+/// update by PR and override per deployment via the `pricing` config block.
+const DEFAULT_PRICING: &str = include_str!("default_pricing.yaml");
+
+impl Pricing {
+    /// The pricing table baked into the binary.
+    pub fn bundled() -> Pricing {
+        Figment::from(Yaml::string(DEFAULT_PRICING))
+            .extract()
+            .unwrap_or_default()
+    }
+
+    /// A copy of this table with `overrides` applied on top: any provider/model
+    /// present in `overrides` replaces the entry here, and new ones are added.
+    pub fn overlaid_with(&self, overrides: &Pricing) -> Pricing {
+        let mut providers = self.providers.clone();
+        for (provider, models) in &overrides.providers {
+            let entry = providers.entry(provider.clone()).or_default();
+            for (model, price) in models {
+                entry.insert(model.clone(), *price);
+            }
+        }
+        Pricing { providers }
+    }
+}
+
 /// USD price per 1,000 input and output tokens for a single model.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ModelPricing {
@@ -269,13 +366,59 @@ impl Default for CacheConfig {
     }
 }
 
-/// Configuration for a single inline plugin. Today the gateway ships one
-/// built-in plugin (`pii_redaction`); third-party WebAssembly plugins land with
-/// the wasmtime host.
+/// Configuration for a single inline plugin. The gateway ships one built-in
+/// native plugin (`pii_redaction`) and loads third-party WebAssembly components
+/// (`wasm`) through the wasmtime host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PluginConfig {
     PiiRedaction(PiiRedactionConfig),
+    Wasm(WasmPluginConfig),
+}
+
+/// Configuration for a WebAssembly component plugin loaded by the wasmtime host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmPluginConfig {
+    /// A stable identifier for the plugin, used in logs and audit events.
+    pub name: String,
+    /// Filesystem path to the `.wasm` component implementing the plugin contract.
+    pub path: String,
+    /// The hook the plugin binds to. Only `inspect-request` is supported today.
+    #[serde(default = "default_plugin_hook")]
+    pub hook: String,
+    /// Hard wall-clock latency budget in milliseconds. The host traps the plugin
+    /// if a single invocation runs past this budget.
+    #[serde(default = "default_latency_budget_ms")]
+    pub latency_budget_ms: u32,
+    /// What the host does when the plugin overruns its budget, traps, or fails to
+    /// instantiate: fail open (forward the request) or fail closed (reject it).
+    #[serde(default = "default_on_timeout")]
+    pub on_timeout: FailMode,
+    /// Virtual model names this plugin applies to. Empty means every route.
+    #[serde(default)]
+    pub bind_routes: Vec<String>,
+}
+
+/// Circuit-breaker policy applied when a plugin overruns its budget or fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailMode {
+    /// Forward the request unchanged when the plugin fails.
+    FailOpen,
+    /// Reject the request when the plugin fails.
+    FailClosed,
+}
+
+fn default_plugin_hook() -> String {
+    "inspect-request".to_string()
+}
+
+fn default_latency_budget_ms() -> u32 {
+    5
+}
+
+fn default_on_timeout() -> FailMode {
+    FailMode::FailOpen
 }
 
 /// Knobs for the PII redaction plugin.
@@ -382,6 +525,110 @@ mod tests {
             assert_eq!(cfg.models[0].fallbacks.len(), 1);
             assert_eq!(cfg.models[0].retry_on, vec![429, 500, 502, 503, 504]);
             assert_eq!(cfg.models[0].timeout_ms, 30_000);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn parses_control_plane_and_shutdown() {
+        figment::Jail::expect_with(|jail| {
+            let cfg = Config::load(None).unwrap();
+            assert_eq!(cfg.control_plane.mode, ControlPlaneMode::File);
+            assert_eq!(cfg.control_plane.config_dir, "/etc/vaultplane");
+            assert!(cfg.control_plane.endpoint.is_none());
+            assert_eq!(cfg.shutdown.drain_timeout_seconds, 30);
+
+            jail.create_file(
+                "cp.yaml",
+                "control_plane:\n  mode: api\n  endpoint: \"https://cloud.example\"\n  \
+                 token_env: VAULTPLANE_CP_TOKEN\nshutdown:\n  drain_timeout_seconds: 5\n",
+            )?;
+            let cfg = Config::load(Some(Path::new("cp.yaml"))).unwrap();
+            assert_eq!(cfg.control_plane.mode, ControlPlaneMode::Api);
+            assert_eq!(
+                cfg.control_plane.endpoint.as_deref(),
+                Some("https://cloud.example")
+            );
+            assert_eq!(
+                cfg.control_plane.token_env.as_deref(),
+                Some("VAULTPLANE_CP_TOKEN")
+            );
+            assert_eq!(cfg.shutdown.drain_timeout_seconds, 5);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn bundled_pricing_is_populated_and_overridable() {
+        let bundled = Pricing::bundled();
+        assert!(bundled.providers.contains_key("openai"));
+        assert!(bundled.providers["openai"].contains_key("gpt-4o"));
+
+        let mut over_models = HashMap::new();
+        over_models.insert(
+            "gpt-4o".to_string(),
+            ModelPricing {
+                input_per_1k_tokens_usd: 1.0,
+                output_per_1k_tokens_usd: 2.0,
+            },
+        );
+        over_models.insert(
+            "custom-model".to_string(),
+            ModelPricing {
+                input_per_1k_tokens_usd: 0.1,
+                output_per_1k_tokens_usd: 0.2,
+            },
+        );
+        let overrides = Pricing {
+            providers: HashMap::from([("openai".to_string(), over_models)]),
+        };
+
+        let merged = bundled.overlaid_with(&overrides);
+        // Override replaces the bundled entry, adds the new one, and leaves other
+        // bundled providers intact.
+        assert_eq!(
+            merged.providers["openai"]["gpt-4o"].input_per_1k_tokens_usd,
+            1.0
+        );
+        assert!(merged.providers["openai"].contains_key("custom-model"));
+        assert!(merged.providers["anthropic"].contains_key("claude-3-7-sonnet"));
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn parses_wasm_plugins_with_defaults_and_overrides() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "plugins.yaml",
+                "plugins:\n  \
+                 - type: wasm\n    name: pii\n    path: /etc/vp/pii.wasm\n  \
+                 - type: wasm\n    name: guard\n    path: /etc/vp/guard.wasm\n    \
+                 hook: inspect-request\n    latency_budget_ms: 10\n    \
+                 on_timeout: fail-closed\n    bind_routes: [chat-default]\n",
+            )?;
+            let cfg = Config::load(Some(Path::new("plugins.yaml"))).unwrap();
+            assert_eq!(cfg.plugins.len(), 2);
+
+            // First entry relies on every default.
+            let PluginConfig::Wasm(first) = &cfg.plugins[0] else {
+                panic!("expected a wasm plugin");
+            };
+            assert_eq!(first.name, "pii");
+            assert_eq!(first.path, "/etc/vp/pii.wasm");
+            assert_eq!(first.hook, "inspect-request");
+            assert_eq!(first.latency_budget_ms, 5);
+            assert_eq!(first.on_timeout, FailMode::FailOpen);
+            assert!(first.bind_routes.is_empty());
+
+            // Second entry overrides every knob.
+            let PluginConfig::Wasm(second) = &cfg.plugins[1] else {
+                panic!("expected a wasm plugin");
+            };
+            assert_eq!(second.latency_budget_ms, 10);
+            assert_eq!(second.on_timeout, FailMode::FailClosed);
+            assert_eq!(second.bind_routes, vec!["chat-default".to_string()]);
 
             Ok(())
         });

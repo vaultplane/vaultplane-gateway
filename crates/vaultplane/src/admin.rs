@@ -23,11 +23,15 @@ use axum::{
 use axum_server::tls_rustls::RustlsConfig;
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::{Deserialize, Serialize};
+use vaultplane_core::audit;
 use vaultplane_core::auth::{
     KeyStore, Period, RateLimiter, SpendLimit, SpendTracker, VirtualKey, constant_time_eq,
     generate_key,
 };
 use vaultplane_core::config::Config;
+
+/// Actor recorded on audit events for actions taken through the admin API.
+const ADMIN_ACTOR: &str = "admin-api";
 
 use crate::runtime::{self, RuntimeHandle};
 
@@ -102,6 +106,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/keys", get(list_keys).post(create_key))
         .route("/admin/keys/{id}", delete(delete_key))
         .route("/admin/keys/{id}/spend", get(key_spend))
+        .route("/admin/models", get(list_models))
         .route("/admin/config/reload", post(reload_config))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -141,7 +146,9 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// Readiness: the gateway has loaded config and is ready to serve.
+/// Readiness: the gateway has loaded its config and at least one configured
+/// provider is reachable. A background prober keeps this flag current, so a pod
+/// whose providers all go unreachable is pulled from rotation.
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     if state.ready.load(Ordering::SeqCst) {
         (StatusCode::OK, "ready")
@@ -267,13 +274,7 @@ async fn create_key(State(state): State<AppState>, Json(body): Json<CreateKeyReq
     };
     state.keys.insert(key.clone());
 
-    tracing::info!(
-        key_id = %key.id,
-        team = %key.team,
-        app = %key.app,
-        env = %key.env,
-        "virtual key issued"
-    );
+    audit::key_created(ADMIN_ACTOR, &key.id, &key.team, &key.app, &key.env);
 
     (
         StatusCode::CREATED,
@@ -289,11 +290,39 @@ async fn delete_key(State(state): State<AppState>, Path(id): Path<String>) -> Re
     if state.keys.remove_by_id(&id) {
         state.rate_limiter.forget(&id);
         state.spend_tracker.forget(&id);
-        tracing::info!(key_id = %id, "virtual key revoked");
+        audit::key_revoked(ADMIN_ACTOR, &id, true);
         StatusCode::NO_CONTENT.into_response()
     } else {
+        audit::key_revoked(ADMIN_ACTOR, &id, false);
         (StatusCode::NOT_FOUND, "key not found").into_response()
     }
+}
+
+/// One entry in the virtual model registry, as reported by `GET /admin/models`.
+#[derive(Debug, Serialize)]
+struct ModelSummary {
+    id: String,
+    provider: String,
+}
+
+/// Response from `GET /admin/models`.
+#[derive(Debug, Serialize)]
+struct ListModelsResponse {
+    data: Vec<ModelSummary>,
+}
+
+/// List the virtual models configured in the running registry.
+async fn list_models(State(state): State<AppState>) -> Response {
+    let runtime = state.runtime.load();
+    let data = runtime
+        .models
+        .iter()
+        .map(|m| ModelSummary {
+            id: m.id.clone(),
+            provider: m.provider.clone(),
+        })
+        .collect();
+    Json(ListModelsResponse { data }).into_response()
 }
 
 /// In-period spend snapshot for a key with a configured `spend_limit`.
@@ -385,6 +414,11 @@ async fn reload_config(State(state): State<AppState>) -> Response {
     match runtime::reload(&state.runtime, Some(path), state.rustls.as_ref()).await {
         Ok(()) => {
             tracing::info!(config_path = %path.display(), "config reloaded");
+            audit::config_reloaded(
+                ADMIN_ACTOR,
+                audit::Outcome::Success,
+                &path.display().to_string(),
+            );
             Json(ReloadResponse {
                 status: "reloaded",
                 config_path: path.display().to_string(),
@@ -393,6 +427,7 @@ async fn reload_config(State(state): State<AppState>) -> Response {
         }
         Err(err) => {
             tracing::warn!(error = %err, "config reload rejected");
+            audit::config_reloaded(ADMIN_ACTOR, audit::Outcome::Failure, &format!("{err:#}"));
             (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response()
         }
     }
@@ -887,6 +922,10 @@ mod tests {
         let (cert_a, key_a) = write_cert(dir.path(), "a");
         let (cert_b, key_b) = write_cert(dir.path(), "b");
 
+        // Building rustls directly (not via tls::build_rustls_config) needs the
+        // process crypto provider installed, since both aws-lc-rs and ring are in
+        // the dependency graph.
+        crate::tls::ensure_default_provider();
         let rustls = RustlsConfig::from_pem_file(&cert_a, &key_a).await.unwrap();
 
         let config_path = dir.path().join("vaultplane.yaml");

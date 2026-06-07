@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 bytes.workspace = true
@@ -27,8 +28,18 @@ thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
 
 [dev-dependencies]
 # Jail (isolated env + cwd for config tests) is behind figment's `test` feature.
 figment = { workspace = true, features = ["test"] }
 wiremock = { workspace = true }
+bytes = { workspace = true }
+# A capturing subscriber for the audit-event tests.
+tracing-subscriber = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "hot_path"
+harness = false

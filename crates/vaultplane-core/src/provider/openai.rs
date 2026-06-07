@@ -66,6 +66,10 @@ impl Connector for OpenAiConnector {
         "openai"
     }
 
+    async fn reachable(&self) -> bool {
+        crate::provider::http_reachable(&self.client, &self.base_url).await
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let url = format!("{}/v1/chat/completions", self.base_url);
         let response = self

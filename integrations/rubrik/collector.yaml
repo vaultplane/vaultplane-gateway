@@ -1,0 +1,52 @@
+# OpenTelemetry Collector preset: VaultPlane Gateway to Rubrik Agent Rewind.
+#
+# STUB pending Rubrik's finalized ingest schema. Forwards request spans and the
+# audit log stream (vaultplane.audit = true) to a Rubrik OTLP endpoint; the
+# endpoint and token are placeholders. Requires the Contrib distribution (the
+# filter processor).
+#
+# Required environment variables:
+#   RUBRIK_OTLP_ENDPOINT   Rubrik OTLP ingest endpoint (placeholder)
+#   RUBRIK_API_TOKEN       bearer token for Rubrik ingest (placeholder)
+#
+# Point the gateway at this Collector with:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector-host>:4318
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  batch: {}
+  # Keep only the audit stream on the logs pipeline: drop any record whose
+  # vaultplane.audit attribute is not the boolean true.
+  filter/audit:
+    error_mode: ignore
+    logs:
+      log_record:
+        - 'attributes["vaultplane.audit"] != true'
+
+exporters:
+  otlphttp/rubrik:
+    endpoint: ${env:RUBRIK_OTLP_ENDPOINT}
+    headers:
+      Authorization: "Bearer ${env:RUBRIK_API_TOKEN}"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/rubrik]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/audit, batch]
+      exporters: [otlphttp/rubrik]

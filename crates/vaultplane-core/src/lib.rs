@@ -9,6 +9,7 @@
 //! implemented; the items here are minimal scaffolding that establishes the module
 //! layout the data plane will grow into.
 
+pub mod audit;
 pub mod auth;
 pub mod cache;
 pub mod config;

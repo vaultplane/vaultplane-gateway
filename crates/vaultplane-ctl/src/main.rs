@@ -169,7 +169,11 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Model {
             action: ModelAction::List,
-        } => bail!("`vaultplane-ctl model list` is not yet implemented"),
+        } => {
+            let endpoint = require_endpoint(cli.endpoint)?;
+            let client = AdminClient::new(endpoint, cli.token)?;
+            model_list(&client).await
+        }
     }
 }
 
@@ -263,6 +267,23 @@ impl AdminClient {
         }
     }
 
+    pub async fn list_models(&self) -> anyhow::Result<ListModelsResponse> {
+        let response = self
+            .auth(self.http.get(self.url("/admin/models")))
+            .send()
+            .await
+            .context("failed to call GET /admin/models")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            bail!("admin API returned {status}: {body}");
+        }
+        response
+            .json::<ListModelsResponse>()
+            .await
+            .context("failed to decode model list response")
+    }
+
     pub async fn status(&self) -> anyhow::Result<serde_json::Value> {
         let response = self
             .auth(self.http.get(self.url("/admin/status")))
@@ -327,6 +348,18 @@ pub struct KeySummary {
 #[derive(Debug, Deserialize)]
 pub struct ListKeysResponse {
     pub data: Vec<KeySummary>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelSummary {
+    pub id: String,
+    #[serde(default)]
+    pub provider: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListModelsResponse {
+    pub data: Vec<ModelSummary>,
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +478,19 @@ async fn key_list(client: &AdminClient) -> anyhow::Result<()> {
             k.env,
             format_models(&k.models)
         );
+    }
+    Ok(())
+}
+
+async fn model_list(client: &AdminClient) -> anyhow::Result<()> {
+    let response = client.list_models().await?;
+    if response.data.is_empty() {
+        println!("(no models configured)");
+        return Ok(());
+    }
+    println!("{:<32} PROVIDER", "MODEL");
+    for m in response.data {
+        println!("{:<32} {}", m.id, m.provider);
     }
     Ok(())
 }
@@ -635,6 +681,27 @@ mod tests {
         assert_eq!(response.data.len(), 2);
         assert_eq!(response.data[0].id, "vp_a");
         assert_eq!(response.data[1].models, vec!["gpt-4o".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_models_decodes_data_array() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {"id": "chat-default", "provider": "openai"},
+                    {"id": "chat-internal", "provider": "anthropic"},
+                ],
+            })))
+            .mount(&server)
+            .await;
+
+        let client = AdminClient::new(server.uri(), None).unwrap();
+        let response = client.list_models().await.unwrap();
+        assert_eq!(response.data.len(), 2);
+        assert_eq!(response.data[0].id, "chat-default");
+        assert_eq!(response.data[1].provider, "anthropic");
     }
 
     #[tokio::test]

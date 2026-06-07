@@ -21,9 +21,11 @@ use std::sync::Arc;
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use axum_server::tls_rustls::RustlsConfig;
+use vaultplane_core::audit;
 use vaultplane_core::cache::ResponseCache;
 use vaultplane_core::config::{Config, Pricing};
-use vaultplane_core::plugin::{PiiRedactionPlugin, Plugin, PluginChain};
+use vaultplane_core::plugin::wasm::WasmPlugin;
+use vaultplane_core::plugin::{PiiRedactionPlugin, Plugin, PluginChain, PluginEntry};
 use vaultplane_core::provider::Connector;
 use vaultplane_core::provider::anthropic::AnthropicConnector;
 use vaultplane_core::provider::azure::AzureConnector;
@@ -162,7 +164,9 @@ pub fn build_runtime(config: &Config) -> anyhow::Result<Runtime> {
         Registry::new(connectors, &config.models).context("failed to build model registry")?;
     let connector: Arc<dyn Connector> = Arc::new(registry);
 
-    let pricing = Arc::new(config.pricing.clone());
+    // Start from the pricing table bundled with the binary, then let the
+    // operator's config override or extend it.
+    let pricing = Arc::new(Pricing::bundled().overlaid_with(&config.pricing));
 
     let cache = if config.cache.enabled {
         let size_bytes = config.cache.size_mb.saturating_mul(1024 * 1024);
@@ -183,19 +187,39 @@ pub fn build_runtime(config: &Config) -> anyhow::Result<Runtime> {
             .collect::<Vec<_>>(),
     );
 
-    let plugins: PluginChain = Arc::new(
-        config
-            .plugins
-            .iter()
-            .map(|p| -> Box<dyn Plugin> {
-                match p {
-                    PluginConfig::PiiRedaction(c) => {
-                        Box::new(PiiRedactionPlugin::new(&c.patterns, c.replacement.clone()))
-                    }
+    // A WebAssembly plugin that fails to load (missing file, invalid component,
+    // contract mismatch) fails the whole build, so a reload keeps the old config.
+    let mut entries: Vec<PluginEntry> = Vec::with_capacity(config.plugins.len());
+    for p in &config.plugins {
+        let entry = match p {
+            PluginConfig::PiiRedaction(c) => {
+                let plugin = PiiRedactionPlugin::new(&c.patterns, c.replacement.clone());
+                audit::plugin_loaded(plugin.name(), "pii_redaction", "built-in");
+                PluginEntry {
+                    plugin: Box::new(plugin) as Box<dyn Plugin>,
+                    bind_routes: Vec::new(),
                 }
-            })
-            .collect(),
-    );
+            }
+            PluginConfig::Wasm(c) => {
+                if c.hook != "inspect-request" {
+                    anyhow::bail!(
+                        "wasm plugin '{}' binds unsupported hook '{}'; only 'inspect-request' is supported",
+                        c.name,
+                        c.hook
+                    );
+                }
+                let plugin = WasmPlugin::load(&c.name, &c.path, c.latency_budget_ms, c.on_timeout)
+                    .with_context(|| format!("failed to load wasm plugin '{}'", c.name))?;
+                audit::plugin_loaded(plugin.name(), "wasm", &c.path);
+                PluginEntry {
+                    plugin: Box::new(plugin) as Box<dyn Plugin>,
+                    bind_routes: c.bind_routes.clone(),
+                }
+            }
+        };
+        entries.push(entry);
+    }
+    let plugins: PluginChain = Arc::new(entries);
 
     Ok(Runtime {
         connector,

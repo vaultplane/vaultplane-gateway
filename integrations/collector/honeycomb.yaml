@@ -1,0 +1,65 @@
+# OpenTelemetry Collector preset: VaultPlane Gateway to Honeycomb.
+#
+# Honeycomb ingests OTLP directly. Metrics require a separate dataset and the
+# x-honeycomb-dataset header; the metrics pipeline below uses a dedicated
+# exporter for that. Use api.eu1.honeycomb.io if your team is in the EU region.
+#
+# Required environment variables:
+#   VAULTPLANE_ADMIN_TOKEN   bearer token for scraping the gateway admin port
+#   HONEYCOMB_API_KEY        Honeycomb ingest API key
+#   HONEYCOMB_METRICS_DATASET  dataset name for metrics, e.g. vaultplane-gateway
+#
+# Point the gateway at this Collector with:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector-host>:4318
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: vaultplane-gateway
+          scrape_interval: 15s
+          metrics_path: /admin/metrics
+          authorization:
+            type: Bearer
+            credentials: ${env:VAULTPLANE_ADMIN_TOKEN}
+          static_configs:
+            - targets: ["vaultplane-gateway:9091"]
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  batch: {}
+
+exporters:
+  otlp/honeycomb:
+    endpoint: api.honeycomb.io:443
+    headers:
+      x-honeycomb-team: ${env:HONEYCOMB_API_KEY}
+  otlp/honeycomb-metrics:
+    endpoint: api.honeycomb.io:443
+    headers:
+      x-honeycomb-team: ${env:HONEYCOMB_API_KEY}
+      x-honeycomb-dataset: ${env:HONEYCOMB_METRICS_DATASET}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/honeycomb]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/honeycomb-metrics]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/honeycomb]

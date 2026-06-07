@@ -415,6 +415,10 @@ impl Connector for AnthropicConnector {
         "anthropic"
     }
 
+    async fn reachable(&self) -> bool {
+        crate::provider::http_reachable(&self.client, &self.base_url).await
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let parts = parse_openai_messages(&request.body)?;
         let stream_requested = request.stream;

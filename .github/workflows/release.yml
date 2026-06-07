@@ -1,0 +1,207 @@
+name: Release
+
+# Produces the artifacts the other tag-triggered workflows do not: statically
+# linked Linux binaries (amd64, arm64), a macOS arm64 binary, the separate
+# vaultplane-ctl binary (bundled alongside the gateway), and the reference PII
+# plugin Wasm component, all attached to a GitHub Release with checksums.
+#
+# The multi-arch Docker image (docker.yml) and the Helm chart (chart.yml)
+# publish from their own workflows on the same `v*` tag, so they are not
+# repeated here.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build a release for, e.g. v1.2.3"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  # Do not cancel an in-flight release; a half-published release is worse than
+  # a queued one.
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: Verify tag matches crate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Tag must equal the crate version
+        id: check
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          crate=$(cargo metadata --no-deps --format-version=1 \
+            | jq -r '.packages[] | select(.name=="vaultplane") | .version')
+          echo "tag=$tag crate version=$crate"
+          if [ "$version" != "$crate" ]; then
+            echo "::error::tag '$tag' does not match crate version '$crate'. Bump [workspace.package] version in Cargo.toml (and charts/vaultplane/Chart.yaml) in the tagged commit."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  binaries:
+    name: ${{ matrix.target }}
+    needs: guard
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux targets are built static against musl. cargo-zigbuild uses zig
+          # as the cross-linker, so both amd64 and arm64 build on an amd64 runner
+          # with no Docker or QEMU.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            build: zigbuild
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            build: zigbuild
+          # macOS arm64 builds natively on the Apple-silicon runner.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            build: build
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Set up zig
+        if: matrix.build == 'zigbuild'
+        uses: mlugg/setup-zig@v1
+
+      - name: Install cargo-zigbuild
+        if: matrix.build == 'zigbuild'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build gateway and ctl
+        run: cargo ${{ matrix.build }} --release --target ${{ matrix.target }} --bin vaultplane --bin vaultplane-ctl
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          version="${{ needs.guard.outputs.version }}"
+          stage="vaultplane-${version}-${{ matrix.target }}"
+          mkdir "$stage"
+          cp "target/${{ matrix.target }}/release/vaultplane" "$stage/"
+          cp "target/${{ matrix.target }}/release/vaultplane-ctl" "$stage/"
+          cp LICENSE NOTICE README.md "$stage/"
+          tar -czf "${stage}.tar.gz" "$stage"
+          shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: |
+            vaultplane-*.tar.gz
+            vaultplane-*.tar.gz.sha256
+          if-no-files-found: error
+
+  plugin:
+    name: Reference PII plugin (wasm)
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Build component
+        run: cargo build --release --manifest-path plugins/pii-redaction/Cargo.toml --target wasm32-wasip2
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          version="${{ needs.guard.outputs.version }}"
+          out="pii_redaction-${version}.wasm"
+          cp plugins/pii-redaction/target/wasm32-wasip2/release/pii_redaction.wasm "$out"
+          shasum -a 256 "$out" > "${out}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-wasm
+          path: |
+            pii_redaction-*.wasm
+            pii_redaction-*.wasm.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [guard, binaries, plugin]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Assemble checksums and release notes
+        run: |
+          set -euo pipefail
+          version="${{ needs.guard.outputs.version }}"
+          # Bundle the OTLP Collector presets and integration materials so they
+          # ship as release artifacts too.
+          tar -czf "dist/vaultplane-integrations-${version}.tar.gz" integrations
+          cd dist
+          # Replace the per-file .sha256 with a single signed-off SHA256SUMS.
+          rm -f ./*.sha256
+          shasum -a 256 ./* > SHA256SUMS
+          cat SHA256SUMS
+          cd ..
+          # Pull this version's section out of the changelog; fall back to a
+          # generic line if the section is not present yet. Literal-prefix
+          # matching (index) avoids regex bracket-escaping differences between
+          # awk implementations.
+          awk -v hdr="## [$version]" '
+            index($0, hdr) == 1 { flag = 1; next }
+            flag && index($0, "## [") == 1 { exit }
+            flag { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "VaultPlane Gateway $version. See CHANGELOG.md for details." > notes.md
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: VaultPlane Gateway ${{ needs.guard.outputs.version }}
+          body_path: notes.md
+          files: dist/*
+          fail_on_unmatched_files: true

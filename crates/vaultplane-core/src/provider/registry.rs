@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::audit;
 use crate::config::ModelConfig;
 use crate::error::{Error, Result};
 use crate::provider::{ChatRequest, ChatResponse, Connector, EmbeddingsRequest};
@@ -90,7 +91,11 @@ impl Registry {
 
 /// Try a model's routes in order, failing over on retryable outcomes. The returned
 /// response's `attempts` field reflects how many providers were tried.
-async fn dispatch(resolved: &ResolvedModel, request: ChatRequest) -> Result<ChatResponse> {
+async fn dispatch(
+    resolved: &ResolvedModel,
+    virtual_model: &str,
+    request: ChatRequest,
+) -> Result<ChatResponse> {
     let last = resolved.routes.len().saturating_sub(1);
     for (index, route) in resolved.routes.iter().enumerate() {
         let is_last = index == last;
@@ -103,10 +108,17 @@ async fn dispatch(resolved: &ResolvedModel, request: ChatRequest) -> Result<Chat
         match tokio::time::timeout(resolved.timeout, route.connector.chat(attempt)).await {
             Ok(Ok(mut response)) => {
                 if !is_last && resolved.retry_on.contains(&response.status) {
+                    let next = route_name(resolved, index + 1);
                     tracing::warn!(
                         provider = route.connector.name(),
                         status = response.status,
                         "retryable status; failing over to the next provider"
+                    );
+                    audit::failover(
+                        virtual_model,
+                        route.connector.name(),
+                        next,
+                        &format!("status {}", response.status),
                     );
                     continue;
                 }
@@ -117,10 +129,17 @@ async fn dispatch(resolved: &ResolvedModel, request: ChatRequest) -> Result<Chat
                 if is_last {
                     return Err(err);
                 }
+                let next = route_name(resolved, index + 1);
                 tracing::warn!(
                     provider = route.connector.name(),
                     error = %err,
                     "provider error; failing over to the next provider"
+                );
+                audit::failover(
+                    virtual_model,
+                    route.connector.name(),
+                    next,
+                    &err.to_string(),
                 );
             }
             Err(_) => {
@@ -130,10 +149,17 @@ async fn dispatch(resolved: &ResolvedModel, request: ChatRequest) -> Result<Chat
                         route.connector.name()
                     )));
                 }
+                let next = route_name(resolved, index + 1);
                 tracing::warn!(
                     provider = route.connector.name(),
                     timeout_ms = resolved.timeout.as_millis(),
                     "provider timed out; failing over to the next provider"
+                );
+                audit::failover(
+                    virtual_model,
+                    route.connector.name(),
+                    next,
+                    &format!("timeout after {}ms", resolved.timeout.as_millis()),
                 );
             }
         }
@@ -142,10 +168,20 @@ async fn dispatch(resolved: &ResolvedModel, request: ChatRequest) -> Result<Chat
     Err(Error::Provider("no providers were attempted".to_string()))
 }
 
+/// The connector name of the route at `index`, or `"none"` if out of range.
+fn route_name(resolved: &ResolvedModel, index: usize) -> &str {
+    resolved
+        .routes
+        .get(index)
+        .map(|route| route.connector.name())
+        .unwrap_or("none")
+}
+
 /// Same shape as [`dispatch`] but for embeddings: tries the model's routes in
 /// order, retrying on the same configured statuses.
 async fn dispatch_embeddings(
     resolved: &ResolvedModel,
+    virtual_model: &str,
     request: EmbeddingsRequest,
 ) -> Result<ChatResponse> {
     let last = resolved.routes.len().saturating_sub(1);
@@ -159,10 +195,17 @@ async fn dispatch_embeddings(
         match tokio::time::timeout(resolved.timeout, route.connector.embeddings(attempt)).await {
             Ok(Ok(mut response)) => {
                 if !is_last && resolved.retry_on.contains(&response.status) {
+                    let next = route_name(resolved, index + 1);
                     tracing::warn!(
                         provider = route.connector.name(),
                         status = response.status,
                         "retryable status; failing over to the next provider"
+                    );
+                    audit::failover(
+                        virtual_model,
+                        route.connector.name(),
+                        next,
+                        &format!("status {}", response.status),
                     );
                     continue;
                 }
@@ -173,10 +216,17 @@ async fn dispatch_embeddings(
                 if is_last {
                     return Err(err);
                 }
+                let next = route_name(resolved, index + 1);
                 tracing::warn!(
                     provider = route.connector.name(),
                     error = %err,
                     "provider error; failing over to the next provider"
+                );
+                audit::failover(
+                    virtual_model,
+                    route.connector.name(),
+                    next,
+                    &err.to_string(),
                 );
             }
             Err(_) => {
@@ -186,10 +236,17 @@ async fn dispatch_embeddings(
                         route.connector.name()
                     )));
                 }
+                let next = route_name(resolved, index + 1);
                 tracing::warn!(
                     provider = route.connector.name(),
                     timeout_ms = resolved.timeout.as_millis(),
                     "provider timed out; failing over to the next provider"
+                );
+                audit::failover(
+                    virtual_model,
+                    route.connector.name(),
+                    next,
+                    &format!("timeout after {}ms", resolved.timeout.as_millis()),
                 );
             }
         }
@@ -205,9 +262,33 @@ impl Connector for Registry {
         "registry"
     }
 
+    async fn reachable(&self) -> bool {
+        // Probe the distinct connectors backing configured models; the gateway is
+        // ready to route once at least one of them answers. With no models
+        // configured there is nothing to route to, so readiness is not blocked.
+        let mut seen = HashSet::new();
+        let mut connectors: Vec<Arc<dyn Connector>> = Vec::new();
+        for model in self.models.values() {
+            for route in &model.routes {
+                if seen.insert(route.connector.name().to_string()) {
+                    connectors.push(route.connector.clone());
+                }
+            }
+        }
+        if connectors.is_empty() {
+            return true;
+        }
+        let probes = connectors.iter().map(|connector| connector.reachable());
+        futures::future::join_all(probes)
+            .await
+            .into_iter()
+            .any(|reachable| reachable)
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         if let Some(resolved) = self.models.get(&request.model) {
-            return dispatch(resolved, request).await;
+            let virtual_model = request.model.clone();
+            return dispatch(resolved, &virtual_model, request).await;
         }
 
         match self.fallback_connector(&request.model) {
@@ -221,7 +302,8 @@ impl Connector for Registry {
 
     async fn embeddings(&self, request: EmbeddingsRequest) -> Result<ChatResponse> {
         if let Some(resolved) = self.models.get(&request.model) {
-            return dispatch_embeddings(resolved, request).await;
+            let virtual_model = request.model.clone();
+            return dispatch_embeddings(resolved, &virtual_model, request).await;
         }
 
         match self.fallback_connector(&request.model) {
@@ -252,6 +334,7 @@ mod tests {
         status: u16,
         body: String,
         calls: Arc<AtomicUsize>,
+        reachable: bool,
     }
 
     impl Stub {
@@ -262,8 +345,20 @@ mod tests {
                 status,
                 body: body.to_string(),
                 calls: calls.clone(),
+                reachable: true,
             });
             (stub, calls)
+        }
+
+        /// A stub used only to exercise readiness probing.
+        fn with_reachable(name: &str, reachable: bool) -> Arc<Stub> {
+            Arc::new(Stub {
+                name: name.to_string(),
+                status: 200,
+                body: String::new(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                reachable,
+            })
         }
     }
 
@@ -271,6 +366,10 @@ mod tests {
     impl Connector for Stub {
         fn name(&self) -> &str {
             &self.name
+        }
+
+        async fn reachable(&self) -> bool {
+            self.reachable
         }
 
         async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
@@ -389,5 +488,42 @@ mod tests {
     async fn unknown_provider_is_a_config_error() {
         let result = Registry::new(HashMap::new(), &[smart_model(vec![503])]);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn reachable_when_any_backing_provider_answers() {
+        let registry = Registry::new(
+            connectors(vec![
+                ("p1", Stub::with_reachable("p1", false)),
+                ("p2", Stub::with_reachable("p2", true)),
+            ]),
+            &[smart_model(vec![503])],
+        )
+        .unwrap();
+        assert!(registry.reachable().await);
+    }
+
+    #[tokio::test]
+    async fn not_reachable_when_all_backing_providers_are_down() {
+        let registry = Registry::new(
+            connectors(vec![
+                ("p1", Stub::with_reachable("p1", false)),
+                ("p2", Stub::with_reachable("p2", false)),
+            ]),
+            &[smart_model(vec![503])],
+        )
+        .unwrap();
+        assert!(!registry.reachable().await);
+    }
+
+    #[tokio::test]
+    async fn reachable_with_no_models_configured() {
+        // Nothing to route to: readiness is not blocked on a provider probe.
+        let registry = Registry::new(
+            connectors(vec![("p1", Stub::with_reachable("p1", false))]),
+            &[],
+        )
+        .unwrap();
+        assert!(registry.reachable().await);
     }
 }

@@ -26,6 +26,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          # wasm32-wasip2 builds the reference PII plugin component that the
+          # wasm host integration tests load.
+          targets: wasm32-wasip2
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -39,8 +42,25 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      - name: Build reference PII plugin (wasm component)
+        # Excluded from the workspace (built for wasm, not the host), so build it
+        # explicitly. The wasm host tests find the artifact via its in-tree path.
+        run: cargo build --release --manifest-path plugins/pii-redaction/Cargo.toml --target wasm32-wasip2
+
       - name: Test
         run: cargo test --workspace
+
+      - name: Build benchmarks
+        # Compile the criterion hot-path benches so they cannot bit-rot. Running
+        # them for real numbers is a manual/offline step (CI runners are too
+        # noisy for stable measurements).
+        run: cargo bench --workspace --no-run
+
+      - name: Latency harness
+        # The end-to-end latency harness is #[ignore]d in the normal run; invoke
+        # it explicitly. It asserts a generous P99 ceiling, so it catches a gross
+        # regression without being flaky on shared runners.
+        run: cargo test -p vaultplane --bin vaultplane -- --ignored latency
 
   coverage:
     name: code coverage (llvm-cov + codecov)
@@ -52,6 +72,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+          targets: wasm32-wasip2
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -62,6 +83,10 @@ jobs:
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Build reference PII plugin (wasm component)
+        # So the wasm host integration tests run (and are measured) here too.
+        run: cargo build --release --manifest-path plugins/pii-redaction/Cargo.toml --target wasm32-wasip2
 
       - name: Generate coverage report
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info

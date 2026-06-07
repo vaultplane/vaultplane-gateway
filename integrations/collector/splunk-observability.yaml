@@ -1,0 +1,70 @@
+# OpenTelemetry Collector preset: VaultPlane Gateway to Splunk Observability Cloud.
+#
+# Requires the OpenTelemetry Collector Contrib distribution (the `sapm` and
+# `signalfx` exporters). Traces go through sapm, metrics through signalfx.
+# Splunk Observability does not ingest OTLP logs directly; route the gateway's
+# audit/log stream to Splunk Platform via a splunk_hec exporter if you need it
+# (see the commented block below).
+#
+# Required environment variables:
+#   VAULTPLANE_ADMIN_TOKEN   bearer token for scraping the gateway admin port
+#   SPLUNK_ACCESS_TOKEN      Splunk Observability access token
+#   SPLUNK_REALM             your realm, e.g. us1
+#
+# Point the gateway at this Collector with:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector-host>:4318
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: vaultplane-gateway
+          scrape_interval: 15s
+          metrics_path: /admin/metrics
+          authorization:
+            type: Bearer
+            credentials: ${env:VAULTPLANE_ADMIN_TOKEN}
+          static_configs:
+            - targets: ["vaultplane-gateway:9091"]
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  batch: {}
+
+exporters:
+  sapm:
+    access_token: ${env:SPLUNK_ACCESS_TOKEN}
+    endpoint: https://ingest.${env:SPLUNK_REALM}.signalfx.com/v2/trace
+  signalfx:
+    access_token: ${env:SPLUNK_ACCESS_TOKEN}
+    realm: ${env:SPLUNK_REALM}
+  # Optional: send the audit/log stream to Splunk Platform over HEC.
+  # splunk_hec/platform:
+  #   token: ${env:SPLUNK_HEC_TOKEN}
+  #   endpoint: ${env:SPLUNK_HEC_ENDPOINT}   # e.g. https://http-inputs-<host>:443/services/collector
+  #   source: vaultplane-gateway
+  #   sourcetype: vaultplane:audit
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [sapm]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [signalfx]
+    # logs:
+    #   receivers: [otlp]
+    #   processors: [memory_limiter, batch]
+    #   exporters: [splunk_hec/platform]

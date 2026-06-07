@@ -1,0 +1,59 @@
+# OpenTelemetry Collector preset: VaultPlane Gateway to Datadog.
+#
+# Requires the OpenTelemetry Collector Contrib distribution (the `datadog`
+# exporter is not in the core distribution).
+#
+# Required environment variables:
+#   VAULTPLANE_ADMIN_TOKEN  bearer token for scraping the gateway admin port
+#   DD_API_KEY              Datadog API key
+#   DD_SITE                 Datadog site, e.g. datadoghq.com or datadoghq.eu
+#
+# Point the gateway at this Collector with:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector-host>:4318
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: vaultplane-gateway
+          scrape_interval: 15s
+          metrics_path: /admin/metrics
+          authorization:
+            type: Bearer
+            credentials: ${env:VAULTPLANE_ADMIN_TOKEN}
+          static_configs:
+            - targets: ["vaultplane-gateway:9091"]
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  batch: {}
+
+exporters:
+  datadog:
+    api:
+      key: ${env:DD_API_KEY}
+      site: ${env:DD_SITE}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [datadog]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [datadog]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [datadog]

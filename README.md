@@ -76,14 +76,21 @@ keeping admin on a tighter perimeter.
   and per-period spend budget (day, week, or month). Spend that exceeds the
   budget is rejected before the upstream is called.
 * **Inline policy on every request.** Plugins run on the request body
-  before it leaves your network. The reference PII-redaction plugin ships
-  in-tree; the plugin trait is the seam a future WebAssembly host slots
-  into.
+  before it leaves your network. WebAssembly components run in a sandbox
+  through an embedded wasmtime host with a hard per-plugin latency budget
+  and a fail-open or fail-closed circuit breaker. The reference
+  PII-redaction plugin ships as one of these; a built-in native version is
+  also available.
 * **Production observability with zero extra wiring.** Every request is one
   OpenTelemetry span with GenAI semantic-convention attributes plus
   `vaultplane.*` attributes for the virtual key, team, app, env, and cost.
   Prometheus metrics for request rate, latency, cost, and rejection
   reasons. Cardinality is bounded by design.
+* **An audit trail you can filter.** Every administrative action and policy
+  decision (key created or revoked, config reloaded, plugin loaded, request
+  rejected by a plugin, provider failover) is emitted as a structured event
+  tagged `vaultplane.audit=true`, on the OTLP logs pipeline alongside the
+  rest of your telemetry.
 * **Operate without restarts.** TLS certs hot-rotate. Config hot-reloads via
   SIGHUP or the admin API. Atomic swap: failed validation keeps the old
   config running.
@@ -142,8 +149,14 @@ down.
 ## Production quick start
 
 For anything beyond localhost you want: a config file, a non-empty key
-store, an admin token, TLS, and a Prometheus scrape. Build from source or
-pull the image (see [Run with Docker](#run-with-docker)).
+store, an admin token, TLS, and a Prometheus scrape. Build from source,
+pull the image (see [Run with Docker](#run-with-docker)), or download a
+prebuilt binary.
+
+Tagged releases (`vX.Y.Z`) attach static binaries for Linux (amd64, arm64)
+and macOS (arm64) to the GitHub Release, each archive bundling both
+`vaultplane` and `vaultplane-ctl` alongside a `SHA256SUMS` file, plus the
+reference PII plugin `pii_redaction.wasm`.
 
 ```bash
 # From source: build the gateway and the operator CLI.
@@ -255,6 +268,11 @@ plugins:
   - type: pii_redaction
     patterns: [ssn, credit_card, phone_us, email]
     replacement: "[REDACTED]"
+  - type: wasm
+    name: pii-redaction
+    path: /etc/vaultplane/plugins/pii_redaction.wasm
+    latency_budget_ms: 5
+    on_timeout: fail-open
 ```
 
 Diff two configs before promoting:
@@ -281,6 +299,11 @@ errors, and timeouts. A model that is not in the registry routes by name
 prefix (`claude*` to Anthropic, everything else to OpenAI). Cache hits
 return with `x-vaultplane-cache: HIT`.
 
+Two optional request headers are honored: `X-VaultPlane-Trace-Id` is recorded
+on the request span (otherwise the span's own trace id stands), and
+`X-VaultPlane-Idempotency-Key` keys the cache instead of the request body, so
+retries with the same key share a cached response.
+
 Provider errors are forwarded with the upstream status code, rewritten
 into the OpenAI error envelope for cross-provider consistency. Connector
 failures return 502 (or 504 for upstream timeouts) with
@@ -294,14 +317,15 @@ in `VAULTPLANE_ADMIN_TOKEN`; health and readiness probes are always open.
 
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
-| GET | `/admin/healthz` | open | Liveness probe. |
-| GET | `/admin/readyz` | open | Readiness probe. |
+| GET | `/admin/healthz` | open | Liveness probe (the process is up). |
+| GET | `/admin/readyz` | open | Readiness probe: 200 once config is loaded and at least one configured provider is reachable, 503 otherwise. |
 | GET | `/admin/status` | token | Version, uptime, key count. |
 | GET | `/admin/metrics` | token | Prometheus text format. |
 | GET | `/admin/keys` | token | List virtual keys (no hashes returned). |
 | POST | `/admin/keys` | token | Issue a new key (returns plaintext token once). |
 | DELETE | `/admin/keys/{id}` | token | Revoke a key and free its rate/spend state. |
 | GET | `/admin/keys/{id}/spend` | token | Current-period spend and remaining budget for a key. |
+| GET | `/admin/models` | token | List the configured virtual models and their providers. |
 | POST | `/admin/config/reload` | token | Reload config and rotate certs in place. |
 
 ## `vaultplane-ctl`
@@ -319,6 +343,8 @@ vaultplane-ctl key create --team core --app web --env prod \
   --model gpt-4o --rps 10 --spend 500/day
 vaultplane-ctl key revoke vp_AbCdEfGhIjKl
 
+vaultplane-ctl model list
+
 vaultplane-ctl config validate vaultplane.yaml
 vaultplane-ctl config diff vaultplane.yaml vaultplane.new.yaml
 ```
@@ -333,8 +359,27 @@ Every request is recorded as a tracing span with OpenTelemetry GenAI
 semantic-convention attributes (`gen_ai.system`, `gen_ai.request.model`,
 `gen_ai.usage.input_tokens`, ...) plus `vaultplane.*` attributes for the
 virtual key, team, app, env, cost, and cache hit. Set
-`OTEL_EXPORTER_OTLP_ENDPOINT` to forward spans to a collector. The Gateway
-does not embed the OpenTelemetry Collector; run it as a sidecar.
+`OTEL_EXPORTER_OTLP_ENDPOINT` to forward both spans (to `/v1/traces`) and
+logs (to `/v1/logs`) to a collector. The Gateway does not embed the
+OpenTelemetry Collector; run it as a sidecar.
+
+Ready-to-edit Collector presets for Dynatrace, Datadog, Splunk Observability,
+New Relic, Grafana Cloud, Elastic, and Honeycomb live in
+[`integrations/`](./integrations), along with a Dynatrace dashboard and setup
+guide and the Rubrik Agent Rewind audit feed.
+
+### Audit log
+
+Administrative actions and policy decisions are emitted as structured events
+on the `vaultplane::audit` tracing target, each tagged `vaultplane.audit=true`
+with canonical `action`, `actor`, `subject`, and `outcome` fields plus
+action-specific metadata. The audited actions are `key.create`, `key.revoke`,
+`config.reload`, `plugin.load`, `plugin.reject`, and `failover`. They flow out
+over the OTLP logs pipeline when an endpoint is set, and appear in the local
+log stream otherwise. Filter on the `vaultplane.audit` field (or the
+`vaultplane::audit` target) to isolate the audit stream. Audit retention,
+search, and a UI are control-plane (Cloud) capabilities; the open-source
+Gateway emits the stream and you store it wherever you like.
 
 Prometheus metrics at `/admin/metrics`:
 
@@ -418,11 +463,15 @@ maps for the limiter and tracker).
 
 ### Inline plugins
 
-A trait-based plugin chain runs on each chat and embeddings request
-between the spend pre-check and the cache lookup. Plugins decide
-`Pass | Modify(body) | Reject(reason)`. The reference PII-redaction plugin
-is native Rust today; the trait shape mirrors the WIT contract a future
-WebAssembly component host will slot into.
+A plugin chain runs on each chat and embeddings request between the spend
+pre-check and the cache lookup. Plugins decide
+`Pass | Modify(body) | Reject(reason)` and can be bound to specific routes.
+Two implementations share the same trait: a built-in native plugin and the
+WebAssembly host. The host embeds wasmtime (Component Model), loads any
+component implementing the `inspect-request` WIT contract, runs it in a WASI
+sandbox with a fresh store per call, and enforces each plugin's latency
+budget with an epoch-deadline trap, failing open or closed per the route
+policy. The reference PII-redaction plugin ships as a WebAssembly component.
 
 ### Auth and accounting
 
@@ -437,11 +486,13 @@ key's spend tracker.
 ### Observability
 
 The Gateway uses `tracing` with the OpenTelemetry SDK. Spans are emitted
-via OTLP to whatever endpoint `OTEL_EXPORTER_OTLP_ENDPOINT` points at.
-Prometheus metrics use the `metrics` crate facade with
-`metrics-exporter-prometheus`; the recorder is installed once at startup
-and rendered on demand by the admin endpoint. The Gateway does not embed
-the OpenTelemetry Collector or run its own Prometheus server.
+via OTLP to whatever endpoint `OTEL_EXPORTER_OTLP_ENDPOINT` points at, and a
+logs bridge (`opentelemetry-appender-tracing`) exports every tracing event,
+including the audit stream, as OTLP logs to the same endpoint. Prometheus
+metrics use the `metrics` crate facade with `metrics-exporter-prometheus`;
+the recorder is installed once at startup and rendered on demand by the admin
+endpoint. The Gateway does not embed the OpenTelemetry Collector or run its
+own Prometheus server.
 
 ---
 

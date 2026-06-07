@@ -1,0 +1,131 @@
+{
+  "dashboardMetadata": {
+    "name": "VaultPlane Gateway",
+    "shared": false,
+    "owner": "",
+    "tags": ["vaultplane", "ai-gateway"],
+    "preset": false
+  },
+  "tiles": [
+    {
+      "name": "Request rate by model",
+      "tileType": "DATA_EXPLORER",
+      "configured": true,
+      "bounds": { "top": 0, "left": 0, "width": 608, "height": 304 },
+      "tileFilter": {},
+      "customName": "Request rate by model",
+      "queries": [
+        {
+          "id": "A",
+          "metricSelector": "vaultplane_requests_total:splitBy(\"model\"):rate",
+          "enabled": true
+        }
+      ],
+      "visualConfig": {
+        "type": "GRAPH_CHART",
+        "global": {},
+        "rules": [
+          { "matcher": "A:", "properties": { "seriesType": "LINE" }, "seriesOverrides": [] }
+        ],
+        "axes": { "xAxis": { "visible": true }, "yAxes": [] },
+        "thresholds": []
+      }
+    },
+    {
+      "name": "P99 latency by model",
+      "tileType": "DATA_EXPLORER",
+      "configured": true,
+      "bounds": { "top": 0, "left": 608, "width": 608, "height": 304 },
+      "tileFilter": {},
+      "customName": "P99 latency by model",
+      "queries": [
+        {
+          "id": "A",
+          "metricSelector": "vaultplane_request_duration_seconds:splitBy(\"model\"):percentile(99)",
+          "enabled": true
+        }
+      ],
+      "visualConfig": {
+        "type": "GRAPH_CHART",
+        "global": {},
+        "rules": [
+          { "matcher": "A:", "properties": { "seriesType": "LINE" }, "seriesOverrides": [] }
+        ],
+        "axes": { "xAxis": { "visible": true }, "yAxes": [] },
+        "thresholds": []
+      }
+    },
+    {
+      "name": "Spend per provider (cents/s)",
+      "tileType": "DATA_EXPLORER",
+      "configured": true,
+      "bounds": { "top": 304, "left": 0, "width": 608, "height": 304 },
+      "tileFilter": {},
+      "customName": "Spend per provider",
+      "queries": [
+        {
+          "id": "A",
+          "metricSelector": "vaultplane_cost_cents_total:splitBy(\"provider\"):rate",
+          "enabled": true
+        }
+      ],
+      "visualConfig": {
+        "type": "GRAPH_CHART",
+        "global": {},
+        "rules": [
+          { "matcher": "A:", "properties": { "seriesType": "AREA" }, "seriesOverrides": [] }
+        ],
+        "axes": { "xAxis": { "visible": true }, "yAxes": [] },
+        "thresholds": []
+      }
+    },
+    {
+      "name": "Requests by cache result",
+      "tileType": "DATA_EXPLORER",
+      "configured": true,
+      "bounds": { "top": 304, "left": 608, "width": 304, "height": 304 },
+      "tileFilter": {},
+      "customName": "Requests by cache result",
+      "queries": [
+        {
+          "id": "A",
+          "metricSelector": "vaultplane_request_duration_seconds:splitBy(\"cache\"):count",
+          "enabled": true
+        }
+      ],
+      "visualConfig": {
+        "type": "PIE_CHART",
+        "global": {},
+        "rules": [
+          { "matcher": "A:", "properties": {}, "seriesOverrides": [] }
+        ],
+        "axes": { "xAxis": { "visible": true }, "yAxes": [] },
+        "thresholds": []
+      }
+    },
+    {
+      "name": "Rejections by reason",
+      "tileType": "DATA_EXPLORER",
+      "configured": true,
+      "bounds": { "top": 304, "left": 912, "width": 304, "height": 304 },
+      "tileFilter": {},
+      "customName": "Rejections by reason",
+      "queries": [
+        {
+          "id": "A",
+          "metricSelector": "vaultplane_rejections_total:splitBy(\"reason\"):rate",
+          "enabled": true
+        }
+      ],
+      "visualConfig": {
+        "type": "GRAPH_CHART",
+        "global": {},
+        "rules": [
+          { "matcher": "A:", "properties": { "seriesType": "BAR" }, "seriesOverrides": [] }
+        ],
+        "axes": { "xAxis": { "visible": true }, "yAxes": [] },
+        "thresholds": []
+      }
+    }
+  ]
+}

@@ -10,6 +10,7 @@
 //! swap the runtime state without dropping in-flight requests.
 
 mod admin;
+mod control_plane;
 mod prom;
 mod proxy;
 mod runtime;
@@ -42,7 +43,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let tracer_provider = telemetry::init()?;
+    let telemetry_providers = telemetry::init()?;
 
     let args = Args::parse();
     let config_path = args.config.as_deref().map(PathBuf::from);
@@ -54,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let result = run(config, config_path).await;
-    telemetry::shutdown(tracer_provider);
+    telemetry::shutdown(telemetry_providers);
     result
 }
 
@@ -93,6 +94,13 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
             config.listen.admin_address
         )
     })?;
+
+    // Select the configuration source (file vs Cloud API). The Cloud path is a
+    // stub in this release; see control_plane.rs.
+    control_plane::bootstrap(&config.control_plane);
+
+    // Captured before `config` is moved into AppState below.
+    let drain_timeout = std::time::Duration::from_secs(config.shutdown.drain_timeout_seconds);
 
     let admin_token = read_admin_token(&config);
 
@@ -159,20 +167,30 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
     }
     tracing::info!(%admin_addr, "admin API listening");
 
-    // Configuration is loaded and the admin listener is bound. The proxy
-    // listener is bound below (TLS or plain), and we set ready after both
-    // accept paths are wired up.
-    state.set_ready(true);
+    // Configuration is loaded and the listeners are bound. Readiness now tracks
+    // provider reachability: a background prober flips `/admin/readyz` to ready
+    // once at least one configured provider answers, and back to not-ready if
+    // they all become unreachable, so orchestrators pull the pod from rotation.
+    spawn_readiness_probe(runtime.clone(), state.clone());
 
     let proxy_app = proxy::router_with_runtime(runtime.clone(), keys, rate_limiter, spend_tracker);
     let admin_app = admin::router(state);
 
-    // Broadcast a single shutdown signal to both servers for a graceful drain.
+    // Broadcast a single shutdown signal to both servers for a graceful drain,
+    // with a hard cap: if draining outlasts the configured timeout, force exit so
+    // a stuck in-flight request cannot hang the process. This bounds both the TLS
+    // and plain-HTTP paths.
     let (tx, rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         shutdown_signal().await;
-        tracing::info!("shutdown signal received; draining in-flight requests");
+        tracing::info!(
+            drain_timeout_seconds = drain_timeout.as_secs(),
+            "shutdown signal received; draining in-flight requests"
+        );
         let _ = tx.send(true);
+        tokio::time::sleep(drain_timeout).await;
+        tracing::warn!("drain timeout reached; forcing shutdown");
+        std::process::exit(0);
     });
 
     // SIGHUP triggers the same reload path the admin API exposes. Unix only;
@@ -187,9 +205,7 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
                 let h = handle.clone();
                 tokio::spawn(async move {
                     let _ = proxy_rx.changed().await;
-                    // 30s drain window matches the plain-HTTP path's implicit
-                    // behavior of awaiting the in-flight set.
-                    h.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
+                    h.graceful_shutdown(Some(drain_timeout));
                 });
                 axum_server::bind_rustls(proxy_addr, rustls)
                     .handle(handle)
@@ -225,6 +241,25 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
     Ok(())
 }
 
+/// How often the background readiness prober checks provider reachability.
+const READINESS_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Spawn a background task that keeps `/admin/readyz` in sync with provider
+/// reachability. It probes immediately on start, then on a fixed interval, and
+/// always reads the current runtime so a config reload that changes providers is
+/// reflected on the next tick.
+fn spawn_readiness_probe(runtime: RuntimeHandle, state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            // Clone the connector out of the runtime snapshot so the arc-swap
+            // guard is not held across the await.
+            let connector = runtime.load().connector.clone();
+            state.set_ready(connector.reachable().await);
+            tokio::time::sleep(READINESS_PROBE_INTERVAL).await;
+        }
+    });
+}
+
 /// Install a SIGHUP handler that re-reads the config file and swaps the
 /// runtime (and the TLS cert, when TLS is enabled) in place. Unix only.
 #[cfg(unix)]
@@ -240,10 +275,28 @@ fn spawn_reload_signal(
             tracing::warn!("failed to install SIGHUP handler; config hot-reload disabled");
             return;
         };
+        let source = config_path
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "defaults".to_string());
         while hup.recv().await.is_some() {
             match runtime::reload(&runtime, config_path.as_deref(), rustls.as_ref()).await {
-                Ok(()) => tracing::info!("config reloaded via SIGHUP"),
-                Err(err) => tracing::error!(error = %err, "SIGHUP config reload failed"),
+                Ok(()) => {
+                    tracing::info!("config reloaded via SIGHUP");
+                    vaultplane_core::audit::config_reloaded(
+                        "sighup",
+                        vaultplane_core::audit::Outcome::Success,
+                        &source,
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "SIGHUP config reload failed");
+                    vaultplane_core::audit::config_reloaded(
+                        "sighup",
+                        vaultplane_core::audit::Outcome::Failure,
+                        &format!("{err:#}"),
+                    );
+                }
             }
         }
     });

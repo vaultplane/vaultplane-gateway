@@ -22,6 +22,8 @@ use bytes::Bytes;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+pub mod wasm;
+
 /// A request as seen by an inline plugin before the gateway forwards it.
 #[derive(Debug, Clone)]
 pub struct PluginRequest {
@@ -57,9 +59,25 @@ pub trait Plugin: Send + Sync {
     fn inspect_request(&self, request: &PluginRequest) -> Decision;
 }
 
+/// A plugin together with the host-level metadata that governs when it runs.
+pub struct PluginEntry {
+    /// The plugin implementation (native or WebAssembly).
+    pub plugin: Box<dyn Plugin>,
+    /// Virtual model names this plugin is bound to. Empty means every route.
+    pub bind_routes: Vec<String>,
+}
+
+impl PluginEntry {
+    /// Whether this plugin should run for a request against the given virtual
+    /// model. An unbound plugin (empty `bind_routes`) runs on every request.
+    pub fn applies_to(&self, virtual_model: &str) -> bool {
+        self.bind_routes.is_empty() || self.bind_routes.iter().any(|r| r == virtual_model)
+    }
+}
+
 /// An ordered chain of inline plugins, suitable for cheap cloning into request
 /// state.
-pub type PluginChain = Arc<Vec<Box<dyn Plugin>>>;
+pub type PluginChain = Arc<Vec<PluginEntry>>;
 
 /// Classes of personally identifiable information the reference plugin can redact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,5 +244,21 @@ mod tests {
             Decision::Pass => {}
             other => panic!("expected Pass, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bound_plugin_runs_only_for_its_routes() {
+        let bound = PluginEntry {
+            plugin: Box::new(PiiRedactionPlugin::default()),
+            bind_routes: vec!["chat-default".to_string()],
+        };
+        assert!(bound.applies_to("chat-default"));
+        assert!(!bound.applies_to("chat-internal"));
+
+        let unbound = PluginEntry {
+            plugin: Box::new(PiiRedactionPlugin::default()),
+            bind_routes: Vec::new(),
+        };
+        assert!(unbound.applies_to("anything"));
     }
 }

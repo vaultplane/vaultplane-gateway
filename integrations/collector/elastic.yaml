@@ -1,0 +1,60 @@
+# OpenTelemetry Collector preset: VaultPlane Gateway to Elastic.
+#
+# Sends OTLP to an Elastic APM endpoint (Elastic Cloud or a self-managed APM
+# Server / Elastic Agent OTLP intake). Elastic authenticates OTLP with an API
+# key in the Authorization header.
+#
+# Required environment variables:
+#   VAULTPLANE_ADMIN_TOKEN   bearer token for scraping the gateway admin port
+#   ELASTIC_OTLP_ENDPOINT    e.g. https://my-deployment.apm.us-east-1.aws.cloud.es.io:443
+#   ELASTIC_APM_API_KEY      base64 API key for OTLP intake
+#
+# Point the gateway at this Collector with:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector-host>:4318
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: vaultplane-gateway
+          scrape_interval: 15s
+          metrics_path: /admin/metrics
+          authorization:
+            type: Bearer
+            credentials: ${env:VAULTPLANE_ADMIN_TOKEN}
+          static_configs:
+            - targets: ["vaultplane-gateway:9091"]
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  batch: {}
+
+exporters:
+  otlp/elastic:
+    endpoint: ${env:ELASTIC_OTLP_ENDPOINT}
+    headers:
+      Authorization: "ApiKey ${env:ELASTIC_APM_API_KEY}"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/elastic]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/elastic]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/elastic]

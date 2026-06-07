@@ -54,6 +54,10 @@ impl Connector for AzureConnector {
         "azure"
     }
 
+    async fn reachable(&self) -> bool {
+        crate::provider::http_reachable(&self.client, &self.base_url).await
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         // The route model is the Azure deployment name, which goes in the URL path.
         let url = format!(

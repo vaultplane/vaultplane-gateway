@@ -64,6 +64,7 @@ stays plain HTTP.
 | --- | --- | --- | --- | --- |
 | `listen.tls.cert_path` | string | required | yes (rotates in place) | Path to a PEM-encoded certificate chain (server cert first, then any intermediates). |
 | `listen.tls.key_path` | string | required | yes (rotates in place) | Path to the PEM-encoded private key for the certificate. |
+| `listen.tls.client_ca_path` | string \| null | null | yes (toggles in place) | Path to a PEM-encoded CA bundle. When set, the proxy requires mutual TLS: clients must present a certificate chaining to one of these CAs or the connection is refused at the handshake. |
 
 ## `providers`
 
@@ -160,8 +161,10 @@ Hot-reload: yes. A reload rebuilds the registry from scratch.
 ## `pricing`
 
 USD pricing per 1,000 input and output tokens, keyed by provider then
-model. Empty means cost is not reported (the OTel `vaultplane.cost_usd`
-attribute and the `vaultplane_cost_cents_total` metric stay at zero).
+model. The gateway ships with a bundled default table for common OpenAI,
+Anthropic, Azure, and Bedrock models, so cost is reported out of the box;
+entries here override or extend it (an exact provider/model match wins). The
+bundled prices are approximate list prices, so set your own to bill accurately.
 
 ```yaml
 pricing:
@@ -199,9 +202,10 @@ entries are discarded.
 
 ## `plugins`
 
-Inline request-inspection plugins. The array order is the chain order.
-Today the gateway ships one built-in plugin (`pii_redaction`); the
-trait shape mirrors the WIT contract a future WebAssembly host slots into.
+Inline request-inspection plugins. The array order is the chain order: each
+plugin sees the body produced by the previous one. Two plugin types are
+supported: the built-in native `pii_redaction` plugin and `wasm` components
+loaded through the wasmtime host.
 
 ### `pii_redaction`
 
@@ -218,7 +222,77 @@ plugins:
 | `patterns` | array | all four | Which patterns to redact. Valid values: `ssn`, `credit_card`, `phone_us`, `email`. |
 | `replacement` | string | `"[REDACTED]"` | String substituted in place of each match. |
 
-Hot-reload: yes. A reload rebuilds the plugin chain.
+### `wasm`
+
+Loads a WebAssembly component that implements the `inspect-request` contract
+(see the plugin SDK WIT). The reference PII plugin ships as one of these; any
+component implementing the contract works.
+
+```yaml
+plugins:
+  - type: wasm
+    name: pii-redaction
+    path: /etc/vaultplane/plugins/pii_redaction.wasm
+    hook: inspect-request
+    latency_budget_ms: 5
+    on_timeout: fail-open
+    bind_routes: [chat-default]
+```
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `type` | `"wasm"` | required | Plugin identifier. |
+| `name` | string | required | Stable identifier used in logs. |
+| `path` | string | required | Path to the `.wasm` component. |
+| `hook` | string | `"inspect-request"` | The hook the plugin binds to. Only `inspect-request` is supported. |
+| `latency_budget_ms` | integer | `5` | Hard wall-clock budget per invocation. The host traps the plugin if it runs past this. |
+| `on_timeout` | `fail-open` \| `fail-closed` | `fail-open` | What the host does when the plugin overruns its budget, traps, or fails to instantiate: forward the request (`fail-open`) or reject it with 403 (`fail-closed`). |
+| `bind_routes` | array | `[]` (all routes) | Virtual model names this plugin runs for. Empty means every request. |
+
+The host runs each plugin in a WASI sandbox (no inherited stdio, no preopened
+directories, bounded linear memory) with a fresh store per invocation, so no
+state leaks between requests. A plugin's pattern set is fixed in its component
+build; use the native `pii_redaction` plugin if you need per-deployment pattern
+configuration today.
+
+In addition to a local path, `path` accepts a `file://` URL or an `http(s)://`
+URL; remote components are downloaded at load time.
+
+Hot-reload: yes. A reload rebuilds the plugin chain (re-reading every `.wasm`
+file from disk). If any plugin fails to load, the reload is rejected and the old
+configuration stays in effect.
+
+## `control_plane`
+
+Selects where configuration comes from. The same binary serves both the
+open-source file path and the Cloud control-plane API path.
+
+```yaml
+control_plane:
+  mode: file               # one of: file, api
+  config_dir: /etc/vaultplane
+  # When mode is "api":
+  # endpoint: "https://cloud.vaultplane.com"
+  # token_env: VAULTPLANE_CP_TOKEN
+```
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `control_plane.mode` | `file` \| `api` | `file` | Configuration source. `api` is a stub in this release: the gateway logs and serves from last-known-good local config, so the data plane keeps running whether or not a control plane is reachable. |
+| `control_plane.config_dir` | string | `/etc/vaultplane` | Directory the file path reads from. |
+| `control_plane.endpoint` | string \| null | null | Cloud endpoint (used when `mode` is `api`). |
+| `control_plane.token_env` | string \| null | null | Env var holding the control plane token (used when `mode` is `api`). |
+
+## `shutdown`
+
+```yaml
+shutdown:
+  drain_timeout_seconds: 30
+```
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `shutdown.drain_timeout_seconds` | integer | `30` | On SIGTERM, how long to let in-flight requests finish before the process forces exit. |
 
 ## Environment variable convention
 

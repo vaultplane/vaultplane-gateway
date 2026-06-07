@@ -100,6 +100,10 @@ impl Connector for BedrockConnector {
         "bedrock"
     }
 
+    async fn reachable(&self) -> bool {
+        crate::provider::http_reachable(&self.client, &self.endpoint).await
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         if request.stream {
             let body = json!({
