@@ -11,9 +11,13 @@ It is the enforcement plane of [VaultPlane](https://vaultplane.com), the
 control plane for AI infrastructure. The VaultPlane Registry defines what is
 trusted; the Gateway enforces it on the wire.
 
-> ⚠️ **Pre-1.0.** The runtime is shipping in the open. The surfaces below
-> work end-to-end and are covered by tests, but APIs and the config schema
-> may still change before 1.0. Pin to a specific commit or image tag.
+> **1.0 is released.** A stable, single-binary data plane: an OpenAI-compatible
+> API, OpenAI / Anthropic / Azure OpenAI / AWS Bedrock connectors, virtual keys
+> with cost and rate limits, an exact-match cache, a WebAssembly policy plugin
+> host, TLS and mutual TLS, and OpenTelemetry traces, metrics, and logs, all
+> covered by tests. Grab a binary from
+> [Releases](https://github.com/vaultplane/vaultplane-gateway/releases), pull
+> `ghcr.io/vaultplane/vaultplane-gateway:1.0.0`, or deploy the Helm chart.
 
 ---
 
@@ -94,8 +98,8 @@ keeping admin on a tighter perimeter.
 * **Operate without restarts.** TLS certs hot-rotate. Config hot-reloads via
   SIGHUP or the admin API. Atomic swap: failed validation keeps the old
   config running.
-* **Self-host on anything.** Single static-ish binary, or a distroless
-  container image (~25 MB) published to GHCR.
+* **Self-host on anything.** A single static binary (Linux amd64/arm64, macOS
+  arm64), or a distroless container image (~25 MB) published to GHCR.
 
 ---
 
@@ -126,7 +130,7 @@ production, but fine on localhost).
 ```bash
 docker run --rm -p 8080:8080 \
   -e OPENAI_API_KEY \
-  ghcr.io/vaultplane/vaultplane-gateway:main
+  ghcr.io/vaultplane/vaultplane-gateway:1.0.0
 ```
 
 In another shell:
@@ -188,18 +192,19 @@ the edge.
 
 ## Run with Docker
 
-Published images live at `ghcr.io/vaultplane/vaultplane-gateway`. Every
-push to `main` produces a new image; tagged releases (`vX.Y.Z`) get semver
-tags plus `latest`.
+Published images live at `ghcr.io/vaultplane/vaultplane-gateway`. Releases
+are tagged with the full version plus the major.minor and `latest`
+(`1.0.0`, `1.0`, `latest`); pin to a version for reproducible deploys. Every
+push to `main` also produces a `main` image for tracking the development tip.
 
 ```bash
-docker pull ghcr.io/vaultplane/vaultplane-gateway:main
+docker pull ghcr.io/vaultplane/vaultplane-gateway:1.0.0
 
 docker run --rm -p 8080:8080 -p 9091:9091 \
   -e OPENAI_API_KEY \
   -e VAULTPLANE_ADMIN_TOKEN \
   -v "$(pwd)/vaultplane.yaml:/etc/vaultplane/vaultplane.yaml:ro" \
-  ghcr.io/vaultplane/vaultplane-gateway:main \
+  ghcr.io/vaultplane/vaultplane-gateway:1.0.0 \
   --config /etc/vaultplane/vaultplane.yaml
 ```
 
@@ -220,9 +225,13 @@ Each example has its own README with the run command and the relevant
 PromQL queries. Both run with no virtual keys and no admin token to keep
 the example surface small; production setup is in the rest of this README.
 
-For Kubernetes, a Helm chart lives under [`charts/vaultplane/`](./charts/vaultplane/)
-with two-port Service, ConfigMap, Secret, optional ServiceMonitor, and a
-PodDisruptionBudget.
+For Kubernetes, a Helm chart is published to GHCR as an OCI chart (source under
+[`charts/vaultplane/`](./charts/vaultplane/)), with a two-port Service,
+ConfigMap, Secret, optional ServiceMonitor, and a PodDisruptionBudget:
+
+```bash
+helm install vaultplane oci://ghcr.io/vaultplane/charts/vaultplane --version 1.0.0
+```
 
 ## Configuration
 
