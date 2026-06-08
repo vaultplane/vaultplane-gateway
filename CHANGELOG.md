@@ -71,6 +71,10 @@ from `v1.0.0` onward; pre-1.0 minor bumps may include breaking changes.
 
 ### Changed
 
+* Outbound provider TLS now uses rustls (with the OS trust store) instead of
+  native-tls/OpenSSL. This removes the OpenSSL build dependency, so the static
+  Linux (musl) release binaries cross-compile cleanly, and matches the inbound
+  TLS stack.
 * `/admin/readyz` now reflects provider reachability. A background prober
   marks the gateway ready once at least one configured provider answers a
   lightweight connectivity check, and not-ready (503) if they all become

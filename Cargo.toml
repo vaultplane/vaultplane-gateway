@@ -46,10 +46,10 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 moka = { version = "0.12", features = ["future"] }
 opentelemetry = "0.27"
 opentelemetry-appender-tracing = "0.27"
-opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client", "logs"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls", "logs", "trace"] }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "logs"] }
 regex = "1"
-reqwest = { version = "0.12", features = ["stream", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "blocking", "json", "http2", "charset", "rustls-tls-native-roots"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
