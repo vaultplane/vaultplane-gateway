@@ -92,6 +92,10 @@ jobs:
       - name: Set up zig
         if: matrix.build == 'zigbuild'
         uses: mlugg/setup-zig@v1
+        with:
+          # Pin a stable release: "latest" resolved to a dev build (0.16.0)
+          # that the download mirrors 404 on. cargo-zigbuild works with 0.13.
+          version: 0.13.0
 
       - name: Install cargo-zigbuild
         if: matrix.build == 'zigbuild'
