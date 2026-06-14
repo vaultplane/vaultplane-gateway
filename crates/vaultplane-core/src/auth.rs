@@ -198,6 +198,19 @@ impl KeyStore {
         self.write().insert(key.hash.clone(), key);
     }
 
+    /// Atomically replace the entire key set.
+    ///
+    /// Used by the control-plane (`api` mode) client when a fresh key set is
+    /// pulled from the Control Node: the swap is a single write so an
+    /// authenticating request sees either the old set or the new one, never a
+    /// half-applied state. Unlike [`insert`](Self::insert), keys not present in
+    /// `keys` are dropped, so revocations on the control plane propagate.
+    pub fn replace_all(&self, keys: Vec<VirtualKey>) {
+        let map: HashMap<String, VirtualKey> =
+            keys.into_iter().map(|k| (k.hash.clone(), k)).collect();
+        *self.write() = map;
+    }
+
     /// Remove a key by its non-secret identifier. Returns `true` if a key was
     /// removed.
     pub fn remove_by_id(&self, id: &str) -> bool {

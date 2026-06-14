@@ -66,6 +66,16 @@ pub struct ControlPlane {
     /// Environment variable holding the control plane token (used when `mode` is `api`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_env: Option<String>,
+    /// How often the `api`-mode client polls the Control Node for config and key
+    /// changes, in seconds. The client also keeps an SSE `watch` stream for fast
+    /// propagation; this poll is the fallback that bounds staleness when the
+    /// stream is unavailable.
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_seconds: u64,
+}
+
+fn default_poll_interval() -> u64 {
+    30
 }
 
 impl Default for ControlPlane {
@@ -75,6 +85,7 @@ impl Default for ControlPlane {
             config_dir: "/etc/vaultplane".to_string(),
             endpoint: None,
             token_env: None,
+            poll_interval_seconds: default_poll_interval(),
         }
     }
 }

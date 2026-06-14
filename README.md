@@ -420,7 +420,7 @@ this section sketches the load-bearing decisions.
 
 The Gateway holds no per-request state across instances. Virtual keys,
 rate-limit buckets, and per-period spend accumulators live in memory on
-each replica; the design is for them to move to the Cloud control plane
+each replica; the design is for them to move to the Control Node
 (out of scope for this repo) for cross-replica consistency. Today, run a
 single replica or partition traffic to a sticky replica per virtual key.
 

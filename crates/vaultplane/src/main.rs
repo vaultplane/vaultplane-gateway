@@ -95,10 +95,6 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
         )
     })?;
 
-    // Select the configuration source (file vs Cloud API). The Cloud path is a
-    // stub in this release; see control_plane.rs.
-    control_plane::bootstrap(&config.control_plane);
-
     // Captured before `config` is moved into AppState below.
     let drain_timeout = std::time::Duration::from_secs(config.shutdown.drain_timeout_seconds);
 
@@ -131,6 +127,12 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
         tracing::info!(count = config.plugins.len(), "loaded inline plugins");
     }
     let runtime: RuntimeHandle = runtime::handle(initial_runtime);
+
+    // Select the configuration source (local file vs the Control Node API). In
+    // file mode this just logs; in api mode it spawns the background client that
+    // keeps the runtime and key store in sync with the Control Node, while
+    // always falling back to the local last-known-good config.
+    control_plane::start(&config, runtime.clone(), keys.clone());
 
     // Load TLS material before binding so a bad cert path fails fast (and
     // before `config` is moved into AppState).

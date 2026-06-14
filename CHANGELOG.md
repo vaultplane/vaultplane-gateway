@@ -7,6 +7,27 @@ from `v1.0.0` onward; pre-1.0 minor bumps may include breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+* `control_plane.mode: api` now runs a real Control Node client (previously a
+  logging stub). It polls `GET /config` and `GET /keys` with ETag conditional
+  fetches (an unchanged resource is a cheap `304`), maps the wire bundle onto the
+  local base config, and atomically swaps the runtime and key store. The bundle
+  carries only control-plane-owned config (models, providers, pricing, plugins,
+  cache); node-local settings (listen, admin, shutdown) stay local. A one-shot
+  `GET /identity` check logs the resolved fleet assignment at startup. The poll
+  interval is configurable via `control_plane.poll_interval_seconds` (default 30).
+* Data-plane survival is preserved end to end: a network failure, a `401` from a
+  revoked or expired token, or a fetched bundle that fails to build all leave the
+  last-known-good runtime serving, logged and audited rather than dropping
+  traffic. The token is read from the env var named by `control_plane.token_env`,
+  never inlined.
+* `KeyStore::replace_all` for atomic key-set swaps from the control plane.
+
+Note: the SSE `GET /watch` push stream and the Bedrock and PII plugin wire
+schemas are pending (the latter await the contract v0.3.1 fixes); the polling
+loop is the supported path until `watch` lands.
+
 ## [1.0.0] - 2026-06-07
 
 ### Added
