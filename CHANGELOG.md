@@ -23,6 +23,10 @@ from `v1.0.0` onward; pre-1.0 minor bumps may include breaking changes.
   traffic. The token is read from the env var named by `control_plane.token_env`,
   never inlined.
 * `KeyStore::replace_all` for atomic key-set swaps from the control plane.
+* End-to-end tests drive a full poll tick against a mock Control Node and assert
+  the live runtime and key store swap, and that a `401` or an unreachable node
+  preserve the last-known-good state. These double as a conformance reference for
+  the Control Node service.
 
 Note: the SSE `GET /watch` push stream and the Bedrock and PII plugin wire
 schemas are pending (the latter await the contract v0.3.1 fixes); the polling

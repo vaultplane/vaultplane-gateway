@@ -92,10 +92,16 @@ impl ControlNodeClient {
         );
         self.log_identity().await;
         loop {
-            self.poll_config(&runtime, &base).await;
-            self.poll_keys(&keys).await;
+            self.tick(&runtime, &keys, &base).await;
             tokio::time::sleep(interval).await;
         }
+    }
+
+    /// One poll pass: refresh config then keys. Factored out of [`run`] so it can
+    /// be driven once, deterministically, in tests.
+    async fn tick(&mut self, runtime: &RuntimeHandle, keys: &Arc<KeyStore>, base: &Config) {
+        self.poll_config(runtime, base).await;
+        self.poll_keys(keys).await;
     }
 
     async fn poll_config(&mut self, runtime: &RuntimeHandle, base: &Config) {
@@ -298,6 +304,157 @@ mod tests {
         assert!(
             matches!(outcome, Fetch::Unauthorized),
             "401 maps to Unauthorized (keep last-known-good), not Err"
+        );
+    }
+}
+
+/// End-to-end tests: drive a full poll tick against a mock Control Node serving
+/// the Gateway Control API, and assert the live runtime and key store actually
+/// swap (and that failures preserve last-known-good). This also serves as a
+/// conformance reference for the Control Node implementation: a real service
+/// matching these request/response shapes will drive the client correctly.
+#[cfg(test)]
+mod e2e {
+    use super::*;
+    use std::sync::Arc;
+    use vaultplane_core::auth::{KeyStore, VirtualKey};
+    use vaultplane_core::config::{Config, ModelConfig, Route};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::runtime::{self, RuntimeHandle};
+
+    const CONFIG_BUNDLE: &str = r#"{
+        "version": "c1",
+        "models": [
+            { "name": "smart", "primary": { "provider": "openai", "model": "gpt-4o" } }
+        ],
+        "providers": { "openai": { "baseUrl": "https://api.openai.com", "apiKeyEnv": "OPENAI_API_KEY" } }
+    }"#;
+
+    const KEY_SET: &str = r#"{
+        "version": "k1",
+        "keys": [
+            { "id": "vp_fromcontrolnode", "hashedKey": "abc123",
+              "scope": { "team": "core", "env": "prod", "allowedModels": ["smart"] },
+              "limits": { "requestsPerSecond": 10 } }
+        ]
+    }"#;
+
+    fn empty_runtime() -> RuntimeHandle {
+        runtime::handle(runtime::build_runtime(&Config::default()).unwrap())
+    }
+
+    fn runtime_with_one_model() -> RuntimeHandle {
+        let mut config = Config::default();
+        config.models = vec![ModelConfig {
+            name: "local-only".to_string(),
+            primary: Route {
+                provider: "openai".to_string(),
+                model: "gpt-4o".to_string(),
+            },
+            fallbacks: Vec::new(),
+            retry_on: vec![429],
+            timeout_ms: 30_000,
+        }];
+        runtime::handle(runtime::build_runtime(&config).unwrap())
+    }
+
+    #[tokio::test]
+    async fn applies_config_and_keys_from_the_control_node() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/config"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"c1\"")
+                    .set_body_string(CONFIG_BUNDLE),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/keys"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"k1\"")
+                    .set_body_string(KEY_SET),
+            )
+            .mount(&server)
+            .await;
+
+        let runtime = empty_runtime();
+        let keys = Arc::new(KeyStore::default());
+        assert!(runtime.load().models.is_empty(), "starts with no models");
+        assert!(keys.is_empty(), "starts with no keys");
+
+        let mut client = ControlNodeClient::new(&server.uri(), "tok".to_string()).unwrap();
+        client.tick(&runtime, &keys, &Config::default()).await;
+
+        // The runtime now reflects the fetched config bundle.
+        let models = &runtime.load().models;
+        assert_eq!(models.len(), 1, "config bundle was applied");
+        assert_eq!(models[0].id, "smart");
+        assert_eq!(models[0].provider, "openai");
+
+        // The key store now holds the control-node-issued key (by its hash).
+        assert_eq!(keys.len(), 1, "key set was applied");
+        let key = keys.find_by_id("vp_fromcontrolnode").expect("key present");
+        assert_eq!(key.hash, "abc123");
+        assert_eq!(key.rate_limit_rps, Some(10));
+
+        // A second tick is conditional: the mock would 200 again, but the point
+        // here is the client now carries ETags so a real node can answer 304.
+    }
+
+    #[tokio::test]
+    async fn unauthorized_keeps_last_known_good() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/config"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/keys"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        // Seed a live runtime and a key so we can prove they survive a 401.
+        let runtime = runtime_with_one_model();
+        let keys = Arc::new(KeyStore::default());
+        let mut seeded = VirtualKey::anonymous();
+        seeded.id = "vp_seeded".to_string();
+        seeded.hash = "seedhash".to_string();
+        keys.insert(seeded);
+
+        let mut client = ControlNodeClient::new(&server.uri(), "revoked".to_string()).unwrap();
+        client.tick(&runtime, &keys, &Config::default()).await;
+
+        // Auth failure must not drop the running config or the existing keys.
+        let models = &runtime.load().models;
+        assert_eq!(models.len(), 1, "runtime preserved on 401");
+        assert_eq!(models[0].id, "local-only");
+        assert!(
+            keys.find_by_id("vp_seeded").is_some(),
+            "existing keys preserved on 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_control_node_keeps_last_known_good() {
+        // No server: point at a closed port so every fetch errors.
+        let runtime = runtime_with_one_model();
+        let keys = Arc::new(KeyStore::default());
+
+        let mut client =
+            ControlNodeClient::new("http://127.0.0.1:1", "tok".to_string()).unwrap();
+        client.tick(&runtime, &keys, &Config::default()).await;
+
+        assert_eq!(
+            runtime.load().models.len(),
+            1,
+            "runtime preserved when the control node is unreachable"
         );
     }
 }
