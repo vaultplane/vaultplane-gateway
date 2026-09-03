@@ -28,9 +28,8 @@ from `v1.0.0` onward; pre-1.0 minor bumps may include breaking changes.
   preserve the last-known-good state. These double as a conformance reference for
   the Control Node service.
 
-Note: the SSE `GET /watch` push stream and the Bedrock and PII plugin wire
-schemas are pending (the latter await the contract v0.3.1 fixes); the polling
-loop is the supported path until `watch` lands.
+Note: the SSE `GET /watch` push stream is pending; the polling loop is the
+supported path until `watch` lands.
 
 ## [1.0.0] - 2026-06-07
 

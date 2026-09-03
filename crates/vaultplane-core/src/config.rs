@@ -48,11 +48,11 @@ pub struct Config {
 
 /// Configuration source selection.
 ///
-/// The same binary serves both the open-source file-based path and the Cloud
-/// control-plane API path; `mode` picks between them. The Cloud client is a stub
-/// in this release: in `api` mode the gateway logs that the control plane is not
-/// yet wired and serves from the last-known-good local configuration, so the
-/// data plane keeps running whether or not a control plane is reachable.
+/// The same binary serves both the open-source file-based path and the Control
+/// Node API path; `mode` picks between them. In `api` mode the gateway polls the
+/// Control Node for config and keys and keeps serving the last-known-good
+/// configuration whenever the Control Node is unreachable or rejects the token,
+/// so the data plane keeps running whether or not a control plane is reachable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ControlPlane {
@@ -67,9 +67,8 @@ pub struct ControlPlane {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_env: Option<String>,
     /// How often the `api`-mode client polls the Control Node for config and key
-    /// changes, in seconds. The client also keeps an SSE `watch` stream for fast
-    /// propagation; this poll is the fallback that bounds staleness when the
-    /// stream is unavailable.
+    /// changes, in seconds. Polling with `If-None-Match` is the supported path;
+    /// the SSE `watch` stream is not consumed yet.
     #[serde(default = "default_poll_interval")]
     pub poll_interval_seconds: u64,
 }
@@ -97,7 +96,7 @@ pub enum ControlPlaneMode {
     /// Read configuration from local files.
     #[default]
     File,
-    /// Pull configuration from the Cloud control plane API (stubbed in this release).
+    /// Pull configuration and keys from the Control Node API.
     Api,
 }
 

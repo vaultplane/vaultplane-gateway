@@ -265,7 +265,7 @@ configuration stays in effect.
 ## `control_plane`
 
 Selects where configuration comes from. The same binary serves both the
-open-source file path and the Cloud control-plane API path.
+open-source file path and the Control Node API path.
 
 ```yaml
 control_plane:
@@ -274,14 +274,33 @@ control_plane:
   # When mode is "api":
   # endpoint: "https://cloud.vaultplane.com"
   # token_env: VAULTPLANE_CP_TOKEN
+  # poll_interval_seconds: 30
 ```
+
+In `api` mode the gateway runs a Control Node client. It polls `GET /config`
+and `GET /keys` at `endpoint` every `poll_interval_seconds` using ETag
+conditional requests (`If-None-Match`), so an unchanged resource is a cheap
+`304` and nothing is rebuilt. A fetched bundle is mapped onto the local base
+config and swapped atomically into the running gateway together with the key
+set. At startup it also performs a one-shot `GET /identity` and logs the
+resolved fleet assignment. The bearer token is read from the environment
+variable named by `token_env`; it is never written inline in the config file.
+
+The data plane keeps serving on any control-plane failure: a network error, a
+`401` from a revoked or expired token, or a bundle that fails to build all leave
+the last-known-good configuration in place, logged and audited rather than
+dropping traffic. If `endpoint` or `token_env` is unset, or the token variable
+is empty, the client is not started and the gateway serves from local config.
+The SSE `GET /watch` push stream is not consumed yet; polling is the supported
+path until it lands.
 
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `control_plane.mode` | `file` \| `api` | `file` | Configuration source. `api` is a stub in this release: the gateway logs and serves from last-known-good local config, so the data plane keeps running whether or not a control plane is reachable. |
+| `control_plane.mode` | `file` \| `api` | `file` | Configuration source. `file` reads local configuration and hot-reloads from disk. `api` polls the Control Node at `endpoint` and swaps fetched config and keys into the running gateway, keeping last-known-good on any failure. |
 | `control_plane.config_dir` | string | `/etc/vaultplane` | Directory the file path reads from. |
-| `control_plane.endpoint` | string \| null | null | Cloud endpoint (used when `mode` is `api`). |
-| `control_plane.token_env` | string \| null | null | Env var holding the control plane token (used when `mode` is `api`). |
+| `control_plane.endpoint` | string \| null | null | Control Node base URL (required when `mode` is `api`). |
+| `control_plane.token_env` | string \| null | null | Env var holding the Control Node bearer token (required when `mode` is `api`). The token itself is never inlined. |
+| `control_plane.poll_interval_seconds` | integer | `30` | How often the `api`-mode client polls `GET /config` and `GET /keys`. A value of `0` is treated as `1`. |
 
 ## `shutdown`
 

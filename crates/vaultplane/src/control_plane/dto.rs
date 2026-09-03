@@ -11,11 +11,11 @@
 //! (see [`super::map`]). The DTOs deserialize the wire shape only; nothing here
 //! enforces policy.
 //!
-//! Status: the core surface (config routing, providers openai/anthropic/azure,
-//! keys, identity) tracks contract v0.3.0. `bedrock`, the PII plugin
-//! discriminator, and `pricing` nesting follow the v0.3.1 punch-list shape from
-//! the Gateway sign-off (`vaultplane-status-room/gateway-int1-signoff.md`); they
-//! are marked below and finalize when the Control Node ships v0.3.1.
+//! Status: these DTOs track Gateway Control API v0.3.1. Everything the v0.3.1
+//! contract added is implemented in this file: the `bedrock` provider config
+//! (SigV4 credential env-var names plus region), the `pii_redaction` plugin
+//! with `patterns` and `replacement`, the `onTimeout` enum on Wasm plugins, and
+//! `Pricing` wrapped under `providers`.
 
 use std::collections::HashMap;
 
@@ -300,7 +300,10 @@ mod tests {
 
         let bedrock = cfg.providers.bedrock.as_ref().expect("bedrock present");
         assert_eq!(bedrock.region.as_deref(), Some("us-east-1"));
-        assert_eq!(bedrock.secret_key_env.as_deref(), Some("AWS_SECRET_ACCESS_KEY"));
+        assert_eq!(
+            bedrock.secret_key_env.as_deref(),
+            Some("AWS_SECRET_ACCESS_KEY")
+        );
 
         assert_eq!(cfg.plugins.len(), 2);
         match &cfg.plugins[0] {

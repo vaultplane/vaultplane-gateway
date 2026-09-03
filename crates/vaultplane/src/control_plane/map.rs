@@ -12,8 +12,8 @@
 
 use vaultplane_core::auth::{self, VirtualKey};
 use vaultplane_core::config::{
-    AzureProvider, CacheConfig, Config, ModelConfig, ModelPricing, OpenAiProvider, PiiRedactionConfig,
-    Pricing, Route, WasmPluginConfig,
+    AzureProvider, CacheConfig, Config, ModelConfig, ModelPricing, OpenAiProvider,
+    PiiRedactionConfig, Pricing, Route, WasmPluginConfig,
 };
 use vaultplane_core::config::{FailMode, PluginConfig};
 use vaultplane_core::plugin::PiiPattern;
@@ -77,7 +77,9 @@ fn apply_providers(config: &mut Config, p: dto::Providers) {
         let base = &mut config.providers.openai;
         *base = OpenAiProvider {
             base_url: openai.base_url.unwrap_or_else(|| base.base_url.clone()),
-            api_key_env: openai.api_key_env.unwrap_or_else(|| base.api_key_env.clone()),
+            api_key_env: openai
+                .api_key_env
+                .unwrap_or_else(|| base.api_key_env.clone()),
         };
     }
     if let Some(anthropic) = p.anthropic {
@@ -91,8 +93,12 @@ fn apply_providers(config: &mut Config, p: dto::Providers) {
         let base = &mut config.providers.azure;
         *base = AzureProvider {
             base_url: azure.base_url.unwrap_or_else(|| base.base_url.clone()),
-            api_key_env: azure.api_key_env.unwrap_or_else(|| base.api_key_env.clone()),
-            api_version: azure.api_version.unwrap_or_else(|| base.api_version.clone()),
+            api_key_env: azure
+                .api_key_env
+                .unwrap_or_else(|| base.api_key_env.clone()),
+            api_version: azure
+                .api_version
+                .unwrap_or_else(|| base.api_version.clone()),
         };
     }
     if let Some(bedrock) = p.bedrock {
@@ -158,7 +164,9 @@ fn map_plugin(p: dto::Plugin) -> PluginConfig {
             name: w.name,
             path: w.path,
             hook: w.hook,
-            latency_budget_ms: w.latency_budget_ms.unwrap_or(DEFAULT_WASM_LATENCY_BUDGET_MS),
+            latency_budget_ms: w
+                .latency_budget_ms
+                .unwrap_or(DEFAULT_WASM_LATENCY_BUDGET_MS),
             on_timeout: w.on_timeout.unwrap_or(FailMode::FailOpen),
             bind_routes: w.bind_routes,
         }),
@@ -174,7 +182,10 @@ pub fn to_virtual_keys(keys: Vec<dto::VirtualKey>) -> Vec<VirtualKey> {
 
 fn map_key(k: dto::VirtualKey) -> VirtualKey {
     let (rate_limit_rps, spend_limit) = match k.limits {
-        Some(limits) => (limits.requests_per_second, limits.spend_limit.map(map_spend)),
+        Some(limits) => (
+            limits.requests_per_second,
+            limits.spend_limit.map(map_spend),
+        ),
         None => (None, None),
     };
     VirtualKey {

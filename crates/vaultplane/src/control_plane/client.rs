@@ -113,7 +113,11 @@ impl ControlNodeClient {
                     Ok(new_runtime) => {
                         runtime.store(Arc::new(new_runtime));
                         tracing::info!(version = %version, "control plane: applied new config bundle");
-                        audit::config_reloaded(ACTOR, Outcome::Success, &format!("config {version}"));
+                        audit::config_reloaded(
+                            ACTOR,
+                            Outcome::Success,
+                            &format!("config {version}"),
+                        );
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -282,12 +286,28 @@ mod tests {
 
         let mut client = ControlNodeClient::new(&server.uri(), "t0ken".to_string()).unwrap();
 
-        let first = client.fetch::<dto::GatewayConfig>(Resource::Config).await.unwrap();
-        assert!(matches!(first, Fetch::Modified(_)), "first fetch returns the body");
-        assert_eq!(client.config_etag.as_deref(), Some("\"v1\""), "etag is stored");
+        let first = client
+            .fetch::<dto::GatewayConfig>(Resource::Config)
+            .await
+            .unwrap();
+        assert!(
+            matches!(first, Fetch::Modified(_)),
+            "first fetch returns the body"
+        );
+        assert_eq!(
+            client.config_etag.as_deref(),
+            Some("\"v1\""),
+            "etag is stored"
+        );
 
-        let second = client.fetch::<dto::GatewayConfig>(Resource::Config).await.unwrap();
-        assert!(matches!(second, Fetch::NotModified), "second fetch is conditional -> 304");
+        let second = client
+            .fetch::<dto::GatewayConfig>(Resource::Config)
+            .await
+            .unwrap();
+        assert!(
+            matches!(second, Fetch::NotModified),
+            "second fetch is conditional -> 304"
+        );
     }
 
     #[tokio::test]
@@ -346,17 +366,19 @@ mod e2e {
     }
 
     fn runtime_with_one_model() -> RuntimeHandle {
-        let mut config = Config::default();
-        config.models = vec![ModelConfig {
-            name: "local-only".to_string(),
-            primary: Route {
-                provider: "openai".to_string(),
-                model: "gpt-4o".to_string(),
-            },
-            fallbacks: Vec::new(),
-            retry_on: vec![429],
-            timeout_ms: 30_000,
-        }];
+        let config = Config {
+            models: vec![ModelConfig {
+                name: "local-only".to_string(),
+                primary: Route {
+                    provider: "openai".to_string(),
+                    model: "gpt-4o".to_string(),
+                },
+                fallbacks: Vec::new(),
+                retry_on: vec![429],
+                timeout_ms: 30_000,
+            }],
+            ..Default::default()
+        };
         runtime::handle(runtime::build_runtime(&config).unwrap())
     }
 
@@ -447,8 +469,7 @@ mod e2e {
         let runtime = runtime_with_one_model();
         let keys = Arc::new(KeyStore::default());
 
-        let mut client =
-            ControlNodeClient::new("http://127.0.0.1:1", "tok".to_string()).unwrap();
+        let mut client = ControlNodeClient::new("http://127.0.0.1:1", "tok".to_string()).unwrap();
         client.tick(&runtime, &keys, &Config::default()).await;
 
         assert_eq!(
