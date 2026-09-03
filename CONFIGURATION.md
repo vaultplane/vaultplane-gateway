@@ -272,7 +272,7 @@ control_plane:
   mode: file               # one of: file, api
   config_dir: /etc/vaultplane
   # When mode is "api":
-  # endpoint: "https://cloud.vaultplane.com"
+  # endpoint: "https://control-node.example/v1"
   # token_env: VAULTPLANE_CP_TOKEN
   # poll_interval_seconds: 30
 ```

@@ -11,7 +11,7 @@
 //! (see [`super::map`]). The DTOs deserialize the wire shape only; nothing here
 //! enforces policy.
 //!
-//! Status: these DTOs track Gateway Control API v0.3.1. Everything the v0.3.1
+//! Status: these DTOs track Gateway Control API v0.3.2 (wire-identical to v0.3.1). Everything the v0.3.1
 //! contract added is implemented in this file: the `bedrock` provider config
 //! (SigV4 credential env-var names plus region), the `pii_redaction` plugin
 //! with `patterns` and `replacement`, the `onTimeout` enum on Wasm plugins, and
