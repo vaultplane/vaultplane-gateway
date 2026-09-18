@@ -33,6 +33,7 @@ use vaultplane_core::config::Config;
 /// Actor recorded on audit events for actions taken through the admin API.
 const ADMIN_ACTOR: &str = "admin-api";
 
+use crate::control_plane::{self, StatusHandle as ControlPlaneStatus};
 use crate::runtime::{self, RuntimeHandle};
 
 /// Content type for the Prometheus text exposition format (version 0.0.4).
@@ -60,6 +61,10 @@ pub struct AppState {
     /// here so the reload path can rotate certs in place via
     /// [`RustlsConfig::reload_from_pem_file`].
     rustls: Option<RustlsConfig>,
+    /// Live state of the Control Node link (or `file` mode), rendered on
+    /// `GET /admin/status` so an operator can see that api mode has fallen
+    /// back to last-known-good, and why.
+    control_plane: ControlPlaneStatus,
 }
 
 impl AppState {
@@ -75,6 +80,7 @@ impl AppState {
         config_path: Option<PathBuf>,
         metrics: PrometheusHandle,
         rustls: Option<RustlsConfig>,
+        control_plane: ControlPlaneStatus,
     ) -> Self {
         Self {
             started_at: Instant::now(),
@@ -88,6 +94,7 @@ impl AppState {
             config_path,
             metrics,
             rustls,
+            control_plane,
         }
     }
 
@@ -148,7 +155,9 @@ async fn healthz() -> impl IntoResponse {
 
 /// Readiness: the gateway has loaded its config and at least one configured
 /// provider is reachable. A background prober keeps this flag current, so a pod
-/// whose providers all go unreachable is pulled from rotation.
+/// whose providers all go unreachable is pulled from rotation. The Control
+/// Node link is deliberately not part of readiness: a gateway serving
+/// last-known-good config is still fit to take traffic (see `/admin/status`).
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     if state.ready.load(Ordering::SeqCst) {
         (StatusCode::OK, "ready")
@@ -166,6 +175,9 @@ struct StatusBody {
     proxy_address: String,
     admin_address: String,
     key_count: usize,
+    /// Where configuration comes from and, in api mode, whether the Control
+    /// Node link is `synced` or `degraded` (serving last-known-good).
+    control_plane: control_plane::status::Snapshot,
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
@@ -176,6 +188,7 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         proxy_address: state.config.listen.address.clone(),
         admin_address: state.config.listen.admin_address.clone(),
         key_count: state.keys.len(),
+        control_plane: state.control_plane.snapshot(),
     })
 }
 
@@ -467,6 +480,22 @@ mod tests {
         config_path: Option<PathBuf>,
         rustls: Option<RustlsConfig>,
     ) -> AppState {
+        state_with_control_plane(
+            token,
+            runtime,
+            config_path,
+            rustls,
+            ControlPlaneStatus::file(),
+        )
+    }
+
+    fn state_with_control_plane(
+        token: Option<&str>,
+        runtime: RuntimeHandle,
+        config_path: Option<PathBuf>,
+        rustls: Option<RustlsConfig>,
+        control_plane: ControlPlaneStatus,
+    ) -> AppState {
         AppState::new(
             Config::default(),
             token.map(str::to_string),
@@ -477,6 +506,7 @@ mod tests {
             config_path,
             prom::install(),
             rustls,
+            control_plane,
         )
     }
 
@@ -562,6 +592,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn status_reports_file_mode_when_there_is_no_control_node() {
+        let app = router(state(None));
+        let response = app
+            .oneshot(request("GET", "/admin/status", None, None))
+            .await
+            .unwrap();
+        let body = body_json(response).await;
+        assert_eq!(body["control_plane"]["state"], "file");
+        assert!(body["control_plane"].get("endpoint").is_none());
+    }
+
+    #[tokio::test]
+    async fn status_surfaces_a_degraded_control_node_link() {
+        use crate::control_plane::status::{Reason, Resource, SyncFailure};
+
+        let link = ControlPlaneStatus::api("http://control-node.example/v1");
+        link.record_tick(
+            Ok(Some("c1".into())),
+            Err(SyncFailure::new(
+                Resource::Keys,
+                Reason::Unauthorized,
+                "401",
+            )),
+        );
+        let app = router(state_with_control_plane(
+            None,
+            empty_runtime(),
+            None,
+            None,
+            link,
+        ));
+
+        let response = app
+            .oneshot(request("GET", "/admin/status", None, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cp = &body_json(response).await["control_plane"];
+        assert_eq!(cp["state"], "degraded");
+        assert_eq!(cp["endpoint"], "http://control-node.example/v1");
+        assert_eq!(cp["config_version"], "c1");
+        assert_eq!(cp["consecutive_failures"], 1);
+        assert_eq!(cp["last_error"]["resource"], "keys");
+        assert_eq!(cp["last_error"]["reason"], "unauthorized");
     }
 
     #[tokio::test]

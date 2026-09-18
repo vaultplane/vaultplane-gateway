@@ -45,6 +45,11 @@ pub struct GatewayConfig {
 }
 
 /// A virtual model and its routing (primary plus ordered fallbacks).
+///
+/// `retry_on` is `Option<Vec<_>>` rather than a defaulted `Vec` so that an
+/// omitted field and an explicit empty array are distinguishable: omitted
+/// takes the Gateway's default failover statuses, while `[]` means "never
+/// fail over", exactly as an empty `retry_on:` list does in a local YAML file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelConfig {
@@ -53,7 +58,7 @@ pub struct ModelConfig {
     #[serde(default)]
     pub fallbacks: Vec<Route>,
     #[serde(default)]
-    pub retry_on: Vec<u16>,
+    pub retry_on: Option<Vec<u16>>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 }
@@ -131,10 +136,13 @@ pub enum Plugin {
     Wasm(WasmPlugin),
 }
 
+/// `patterns` follows the same omitted-vs-empty rule as `ModelConfig::retry_on`:
+/// omitted means every built-in pattern, `[]` means a plugin that redacts
+/// nothing, as it does in file mode.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PiiRedactionPlugin {
     #[serde(default)]
-    pub patterns: Vec<PiiPattern>,
+    pub patterns: Option<Vec<PiiPattern>>,
     #[serde(default)]
     pub replacement: Option<String>,
 }
@@ -295,7 +303,7 @@ mod tests {
         assert_eq!(cfg.models.len(), 1);
         assert_eq!(cfg.models[0].name, "smart");
         assert_eq!(cfg.models[0].primary.model, "gpt-4o");
-        assert_eq!(cfg.models[0].retry_on, vec![429, 503]);
+        assert_eq!(cfg.models[0].retry_on, Some(vec![429, 503]));
         assert_eq!(cfg.models[0].timeout_ms, Some(20000));
 
         let bedrock = cfg.providers.bedrock.as_ref().expect("bedrock present");
@@ -308,7 +316,7 @@ mod tests {
         assert_eq!(cfg.plugins.len(), 2);
         match &cfg.plugins[0] {
             Plugin::PiiRedaction(p) => {
-                assert_eq!(p.patterns.len(), 2);
+                assert_eq!(p.patterns.as_ref().map(Vec::len), Some(2));
                 assert_eq!(p.replacement.as_deref(), Some("[X]"));
             }
             _ => panic!("expected pii_redaction first"),
@@ -320,6 +328,36 @@ mod tests {
                 assert_eq!(w.bind_routes, vec!["smart".to_string()]);
             }
             _ => panic!("expected wasm second"),
+        }
+    }
+
+    #[test]
+    fn omitted_and_empty_arrays_are_distinguishable() {
+        let json = r#"{
+            "version": "v1",
+            "models": [
+                { "name": "omitted", "primary": { "provider": "openai", "model": "gpt-4o" } },
+                { "name": "empty", "primary": { "provider": "openai", "model": "gpt-4o" }, "retryOn": [] }
+            ],
+            "plugins": [
+                { "type": "pii_redaction" },
+                { "type": "pii_redaction", "patterns": [] }
+            ]
+        }"#;
+
+        let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.models[0].retry_on, None, "omitted stays None");
+        assert_eq!(
+            cfg.models[1].retry_on,
+            Some(vec![]),
+            "explicit [] is Some(empty)"
+        );
+        match (&cfg.plugins[0], &cfg.plugins[1]) {
+            (Plugin::PiiRedaction(omitted), Plugin::PiiRedaction(empty)) => {
+                assert_eq!(omitted.patterns, None);
+                assert_eq!(empty.patterns, Some(vec![]));
+            }
+            _ => panic!("expected two pii_redaction plugins"),
         }
     }
 

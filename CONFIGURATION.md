@@ -289,10 +289,31 @@ variable named by `token_env`; it is never written inline in the config file.
 The data plane keeps serving on any control-plane failure: a network error, a
 `401` from a revoked or expired token, or a bundle that fails to build all leave
 the last-known-good configuration in place, logged and audited rather than
-dropping traffic. If `endpoint` or `token_env` is unset, or the token variable
-is empty, the client is not started and the gateway serves from local config.
-The SSE `GET /watch` push stream is not consumed yet; polling is the supported
-path until it lands.
+dropping traffic. A bundle that fails to build does not advance the ETag, so the
+same version is fetched again on the next poll and a corrected version applies
+as soon as the Control Node serves it. If `endpoint` or `token_env` is unset,
+or the token variable is empty, the client is not started and the gateway
+serves from local config. The SSE `GET /watch` push stream is not consumed yet;
+polling is the supported path until it lands.
+
+Because that fallback is silent by design, the link's health is reported on
+`GET /admin/status` under `control_plane` (also printed by `vaultplane-ctl
+status`): the `state` is `file`, `pending` (no poll completed yet), `synced`,
+or `degraded` (serving last-known-good), alongside the applied
+`config_version` and `keys_version`, the enrolled `identity`,
+`last_success_seconds_ago`, `consecutive_failures`, and the `last_error` with
+its `resource`, `reason` (`unauthorized`, `transport`, `unexpected_status`,
+`invalid_body`, `build_failed`, or `not_started`), and `detail`. A transition
+into or out of `degraded` is also recorded as a `control_plane.sync` audit
+event. `/admin/readyz` does not reflect the link: a gateway on last-known-good
+config is still fit to take traffic, and pulling it from rotation during a
+Control Node outage would defeat the point.
+
+Omitted fields in a fetched bundle take the same defaults as an omitted field in
+this file (for example `retryOn` falls back to `[429, 500, 502, 503, 504]` and
+`patterns` to every built-in PII pattern). An explicit empty array is honored as
+empty in both modes: `retryOn: []` never fails over and `patterns: []` redacts
+nothing.
 
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |

@@ -6,7 +6,8 @@
 //! The gateway records every administrative action and policy decision as a
 //! structured event on the standard tracing pipeline: a virtual key created or
 //! revoked, the configuration reloaded, a plugin loaded, a request rejected by a
-//! plugin, and a provider failover. Each event is emitted under the
+//! plugin, a provider failover, and the Control Node link degrading or
+//! recovering. Each event is emitted under the
 //! [`AUDIT_TARGET`] target and carries `vaultplane.audit = true` so operators can
 //! filter the audit stream out of ordinary logs, plus the canonical fields
 //! `action`, `actor`, `subject`, and `outcome` and any action-specific metadata.
@@ -121,6 +122,29 @@ pub fn plugin_rejected(virtual_key_id: &str, plugin: &str, reason: &str, status:
     );
 }
 
+/// The Control Node link changed state. Emitted on transitions only, never on
+/// every failing poll: once when the link degrades (or the failure changes
+/// shape) and once when it recovers, so a long outage is two events rather
+/// than one per poll interval. On failure `resource` names the resource that
+/// failed (`config` or `keys`), `reason` is a closed vocabulary (`unauthorized`,
+/// `transport`, `unexpected_status`, `invalid_body`, `build_failed`,
+/// `not_started`), and `detail` is the free-form error. On recovery the three
+/// are empty. The gateway keeps serving last-known-good either way.
+pub fn control_plane_sync(outcome: Outcome, resource: &str, reason: &str, detail: &str) {
+    tracing::info!(
+        target: AUDIT_TARGET,
+        action = "control_plane.sync",
+        "vaultplane.audit" = true,
+        actor = "control-plane",
+        subject = "link",
+        outcome = outcome.as_str(),
+        resource = resource,
+        reason = reason,
+        detail = detail,
+        "control plane link state changed",
+    );
+}
+
 /// A request failed over from one provider to the next. `subject` is the virtual
 /// model being served.
 pub fn failover(virtual_model: &str, from_provider: &str, to_provider: &str, reason: &str) {
@@ -206,6 +230,38 @@ mod tests {
         assert!(
             out.contains("outcome=\"failure\""),
             "should be a failure: {out}"
+        );
+    }
+
+    #[test]
+    fn control_plane_sync_failure_carries_resource_and_reason() {
+        let out = capture(|| {
+            control_plane_sync(
+                Outcome::Failure,
+                "config",
+                "unauthorized",
+                "401 Unauthorized",
+            )
+        });
+        assert!(
+            out.contains("action=\"control_plane.sync\""),
+            "missing action: {out}"
+        );
+        assert!(
+            out.contains("actor=\"control-plane\""),
+            "missing actor: {out}"
+        );
+        assert!(
+            out.contains("outcome=\"failure\""),
+            "should be a failure: {out}"
+        );
+        assert!(
+            out.contains("resource=\"config\""),
+            "missing resource: {out}"
+        );
+        assert!(
+            out.contains("reason=\"unauthorized\""),
+            "missing reason: {out}"
         );
     }
 

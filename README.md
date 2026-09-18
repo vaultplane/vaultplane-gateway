@@ -92,7 +92,8 @@ keeping admin on a tighter perimeter.
   reasons. Cardinality is bounded by design.
 * **An audit trail you can filter.** Every administrative action and policy
   decision (key created or revoked, config reloaded, plugin loaded, request
-  rejected by a plugin, provider failover) is emitted as a structured event
+  rejected by a plugin, provider failover, Control Node link degraded or
+  recovered) is emitted as a structured event
   tagged `vaultplane.audit=true`, on the OTLP logs pipeline alongside the
   rest of your telemetry.
 * **Operate without restarts.** TLS certs hot-rotate. Config hot-reloads via
@@ -328,7 +329,7 @@ in `VAULTPLANE_ADMIN_TOKEN`; health and readiness probes are always open.
 | --- | --- | --- | --- |
 | GET | `/admin/healthz` | open | Liveness probe (the process is up). |
 | GET | `/admin/readyz` | open | Readiness probe: 200 once config is loaded and at least one configured provider is reachable, 503 otherwise. |
-| GET | `/admin/status` | token | Version, uptime, key count. |
+| GET | `/admin/status` | token | Version, uptime, key count, and the Control Node link state (`control_plane.state` of `file`, `pending`, `synced`, or `degraded`, with the applied versions and last error). |
 | GET | `/admin/metrics` | token | Prometheus text format. |
 | GET | `/admin/keys` | token | List virtual keys (no hashes returned). |
 | POST | `/admin/keys` | token | Issue a new key (returns plaintext token once). |
@@ -383,7 +384,9 @@ Administrative actions and policy decisions are emitted as structured events
 on the `vaultplane::audit` tracing target, each tagged `vaultplane.audit=true`
 with canonical `action`, `actor`, `subject`, and `outcome` fields plus
 action-specific metadata. The audited actions are `key.create`, `key.revoke`,
-`config.reload`, `plugin.load`, `plugin.reject`, and `failover`. They flow out
+`config.reload`, `plugin.load`, `plugin.reject`, `failover`, and
+`control_plane.sync` (the Control Node link degrading or recovering, emitted on
+the transition rather than on every poll). They flow out
 over the OTLP logs pipeline when an endpoint is set, and appear in the local
 log stream otherwise. Filter on the `vaultplane.audit` field (or the
 `vaultplane::audit` target) to isolate the audit stream. Audit retention,

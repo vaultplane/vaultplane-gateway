@@ -131,8 +131,9 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
     // Select the configuration source (local file vs the Control Node API). In
     // file mode this just logs; in api mode it spawns the background client that
     // keeps the runtime and key store in sync with the Control Node, while
-    // always falling back to the local last-known-good config.
-    control_plane::start(&config, runtime.clone(), keys.clone());
+    // always falling back to the local last-known-good config. The returned
+    // handle is what `/admin/status` renders as the link state.
+    let control_plane_status = control_plane::start(&config, runtime.clone(), keys.clone());
 
     // Load TLS material before binding so a bad cert path fails fast (and
     // before `config` is moved into AppState).
@@ -156,6 +157,7 @@ async fn run(config: Config, config_path: Option<PathBuf>) -> anyhow::Result<()>
         config_path.clone(),
         metrics_handle,
         tls_config.clone(),
+        control_plane_status,
     );
 
     let admin_listener = TcpListener::bind(admin_addr)

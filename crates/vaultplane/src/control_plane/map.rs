@@ -21,7 +21,9 @@ use vaultplane_core::plugin::PiiPattern;
 use super::dto;
 
 // Mirror the serde defaults on the Gateway's own `ModelConfig` so a bundle that
-// omits these gets the same behavior as a local YAML file that omits them.
+// omits these gets the same behavior as a local YAML file that omits them. Only
+// an OMITTED field takes the default; an explicit empty array is honored as
+// empty, again matching file mode (see the `Option<Vec<_>>` fields in `dto`).
 const DEFAULT_RETRY_ON: [u16; 5] = [429, 500, 502, 503, 504];
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_WASM_LATENCY_BUDGET_MS: u32 = 5;
@@ -53,11 +55,7 @@ fn map_model(m: dto::ModelConfig) -> ModelConfig {
         name: m.name,
         primary: map_route(m.primary),
         fallbacks: m.fallbacks.into_iter().map(map_route).collect(),
-        retry_on: if m.retry_on.is_empty() {
-            DEFAULT_RETRY_ON.to_vec()
-        } else {
-            m.retry_on
-        },
+        retry_on: m.retry_on.unwrap_or_else(|| DEFAULT_RETRY_ON.to_vec()),
         timeout_ms: m.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
     }
 }
@@ -151,11 +149,7 @@ fn apply_cache(config: &mut Config, c: dto::CacheConfig) {
 fn map_plugin(p: dto::Plugin) -> PluginConfig {
     match p {
         dto::Plugin::PiiRedaction(pii) => PluginConfig::PiiRedaction(PiiRedactionConfig {
-            patterns: if pii.patterns.is_empty() {
-                PiiPattern::ALL.to_vec()
-            } else {
-                pii.patterns
-            },
+            patterns: pii.patterns.unwrap_or_else(|| PiiPattern::ALL.to_vec()),
             replacement: pii
                 .replacement
                 .unwrap_or_else(|| DEFAULT_PII_REPLACEMENT.to_string()),
@@ -271,6 +265,33 @@ mod tests {
             PluginConfig::PiiRedaction(c) => {
                 assert_eq!(c.patterns.len(), PiiPattern::ALL.len());
                 assert_eq!(c.replacement, DEFAULT_PII_REPLACEMENT);
+            }
+            _ => panic!("expected a pii plugin"),
+        }
+    }
+
+    #[test]
+    fn explicit_empty_arrays_are_honored_not_defaulted() {
+        let bundle: dto::GatewayConfig = serde_json::from_str(
+            r#"{
+                "version": "v1",
+                "models": [
+                    { "name": "no-failover", "primary": { "provider": "openai", "model": "gpt-4o" },
+                      "retryOn": [] }
+                ],
+                "plugins": [ { "type": "pii_redaction", "patterns": [] } ]
+            }"#,
+        )
+        .unwrap();
+
+        let config = apply_config(&Config::default(), bundle);
+
+        // `retryOn: []` means never fail over, as in file mode; it must not be
+        // silently replaced with the default status list.
+        assert!(config.models[0].retry_on.is_empty());
+        match &config.plugins[0] {
+            PluginConfig::PiiRedaction(c) => {
+                assert!(c.patterns.is_empty(), "patterns: [] stays empty");
             }
             _ => panic!("expected a pii plugin"),
         }

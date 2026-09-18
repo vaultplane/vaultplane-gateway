@@ -27,6 +27,34 @@ from `v1.0.0` onward; pre-1.0 minor bumps may include breaking changes.
   the live runtime and key store swap, and that a `401` or an unreachable node
   preserve the last-known-good state. These double as a conformance reference for
   the Control Node service.
+* `GET /admin/status` gains a `control_plane` block so an operator can see that
+  api mode has fallen back to last-known-good, and why. It reports the link
+  `state` (`file`, `pending`, `synced`, or `degraded`), the `endpoint`, the
+  `config_version` and `keys_version` currently applied, the enrolled
+  `identity` from `GET /identity`, `last_success_seconds_ago`,
+  `consecutive_failures`, and the `last_error` (`resource`, a closed `reason`
+  vocabulary of `unauthorized`, `transport`, `unexpected_status`,
+  `invalid_body`, `build_failed`, or `not_started`, and free-form `detail`).
+  `vaultplane-ctl status` prints it as part of the same JSON. `/admin/readyz`
+  is deliberately unchanged: a gateway serving last-known-good config is still
+  fit for traffic.
+* A new audit action, `control_plane.sync`, records the link degrading (or the
+  failure changing shape) and recovering. It fires on those transitions only,
+  so a long Control Node outage is two audit events rather than one per poll,
+  while every failing poll still logs a warning.
+
+### Fixed
+
+* A fetched config bundle that parsed but failed to build (for example a model
+  routed to an unknown provider) had its ETag stored anyway, so every later poll
+  answered `304` and the broken version was never retried. The ETag is now
+  committed only after the bundle is applied; a failing version is fetched again
+  each tick and the fix applies as soon as the Control Node ships it.
+* In api mode an explicit empty `retryOn` or `patterns` array was silently
+  replaced with the defaults (the failover status list, or every built-in PII
+  pattern), while the same empty list in a local YAML file was honored. Both are
+  now honored in api mode too: omitting the field takes the default, `[]` means
+  never fail over or redact nothing, matching file mode.
 
 Note: the SSE `GET /watch` push stream is pending; the polling loop is the
 supported path until `watch` lands.
